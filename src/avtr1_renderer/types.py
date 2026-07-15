@@ -43,9 +43,9 @@ class KPInfo:
     exp: torch.Tensor  # (1, 21, 3)  expression deltas
     scale: torch.Tensor  # (1, 1)      per-portrait scale
     t: torch.Tensor  # (1, 3)      translation
-    pitch: torch.Tensor  # (1, 1)      pitch in radians
-    yaw: torch.Tensor  # (1, 1)
-    roll: torch.Tensor  # (1, 1)
+    pitch: torch.Tensor  # (1, 1)      pitch in degrees
+    yaw: torch.Tensor  # (1, 1)      yaw in degrees
+    roll: torch.Tensor  # (1, 1)      roll in degrees
     R: torch.Tensor  # (1, 3, 3)   rotation matrix derived from p/y/r
 
 

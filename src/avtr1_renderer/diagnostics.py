@@ -125,9 +125,9 @@ def record_avatar_registration(
             "crop_rotation": crop_rotation,
             "source_motion_scale": kp_info.scale.detach().float().reshape(-1).tolist(),
             "source_translation": kp_info.t.detach().float().reshape(-1).tolist(),
-            "source_pitch_rad": kp_info.pitch.detach().float().reshape(-1).tolist(),
-            "source_yaw_rad": kp_info.yaw.detach().float().reshape(-1).tolist(),
-            "source_roll_rad": kp_info.roll.detach().float().reshape(-1).tolist(),
+            "source_pitch_deg": kp_info.pitch.detach().float().reshape(-1).tolist(),
+            "source_yaw_deg": kp_info.yaw.detach().float().reshape(-1).tolist(),
+            "source_roll_deg": kp_info.roll.detach().float().reshape(-1).tolist(),
         },
     )
 
