@@ -30,8 +30,16 @@ from collections.abc import Iterator
 import torch
 
 from avtr1_renderer.avatar_loader import Avatar
-from avtr1_renderer.components.liveportrait.motion_stitch import MotionFrame, motion_stitch
+from avtr1_renderer.components.liveportrait.motion_stitch import (
+    MotionFrame,
+    motion_stitch,
+)
 from avtr1_renderer.components.putback import putback_chunk
+from avtr1_renderer.diagnostics import (
+    alpha_frame_metrics,
+    record_render_alpha,
+)
+from avtr1_renderer.diagnostics import enabled as diagnostics_enabled
 from avtr1_renderer.models.decoder import DecoderEngine, DecoderInput, DecoderOutput
 from avtr1_renderer.models.matting import MODNetEngine
 from avtr1_renderer.models.stitch import StitchEngine
@@ -64,12 +72,25 @@ def render_chunk_streaming(
     warped = warp(
         WarpInput(feature_3d=f_s_b, kp_source=x_s_b, kp_driving=x_d_all.contiguous())
     ).out
+    collect_diagnostics = diagnostics_enabled()
+    alpha_means: list[torch.Tensor] = []
+    alpha_coverages: list[torch.Tensor] = []
     for i in range(n):
         face = torch.empty((1, 3, 512, 512), dtype=torch.float32, device="cuda")
         decoder(DecoderInput(feature=warped[i : i + 1]), out=DecoderOutput(output=face))
         face.clamp_(0.0, 1.0)
         rgb, alpha = putback_chunk(face, avatar, bg, matting=matting)
+        if collect_diagnostics:
+            alpha_mean, alpha_coverage = alpha_frame_metrics(alpha)
+            alpha_means.append(alpha_mean)
+            alpha_coverages.append(alpha_coverage)
         yield rgb, alpha
+    if collect_diagnostics:
+        record_render_alpha(
+            torch.cat(alpha_means),
+            torch.cat(alpha_coverages),
+            no_matting=avatar.no_matting,
+        )
 
 
 def render_chunk(
@@ -125,7 +146,15 @@ def render_chunk(
         face_slot.output = faces[i : i + 1]
         decoder(DecoderInput(feature=warped[i : i + 1]), out=face_slot)
     faces.clamp_(0.0, 1.0)
-    return putback_chunk(faces, avatar, bg, matting=matting)
+    rgb, alpha = putback_chunk(faces, avatar, bg, matting=matting)
+    if diagnostics_enabled():
+        alpha_mean, alpha_coverage = alpha_frame_metrics(alpha)
+        record_render_alpha(
+            alpha_mean,
+            alpha_coverage,
+            no_matting=avatar.no_matting,
+        )
+    return rgb, alpha
 
 
 __all__ = ["render_chunk", "render_chunk_streaming"]

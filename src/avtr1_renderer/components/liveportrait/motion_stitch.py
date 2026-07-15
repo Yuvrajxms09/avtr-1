@@ -32,6 +32,7 @@ from dataclasses import dataclass
 import torch
 
 from avtr1_renderer.constants import LIPSYNC_COORDS
+from avtr1_renderer.diagnostics import record_keypoint_geometry
 from avtr1_renderer.models.stitch import StitchEngine, StitchInput
 from avtr1_renderer.types import KPInfo
 
@@ -180,6 +181,7 @@ def motion_stitch(
     x_d = stitch(
         StitchInput(kp_source=x_s_b, kp_driving=x_d_raw.contiguous())
     ).out
+    record_keypoint_geometry(x_s, x_d_raw, x_d)
     return x_s, x_d
 
 

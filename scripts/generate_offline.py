@@ -21,6 +21,7 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 from pathlib import Path
 
@@ -28,7 +29,10 @@ import imageio_ffmpeg
 import numpy as np
 import soundfile as sf
 import soxr
+import torch
 
+from avtr1_renderer.avatar_loader import CropConfig
+from avtr1_renderer.diagnostics import LOGGER_NAME, record_session
 from avtr1_renderer.pipeline import Pipeline
 from avtr1_renderer.types import Chunk, RenderOptions
 
@@ -66,15 +70,15 @@ def _align_tracks(
     if speech is None and listen is None and duration is None:
         raise ValueError("Provide at least one of --speech, --listen, --duration.")
     if duration is not None:
-        n = int(round(duration * SAMPLE_RATE))
+        n = round(duration * SAMPLE_RATE)
     else:
         n = max(
             speech.shape[0] if speech is not None else 0,
             listen.shape[0] if listen is not None else 0,
         )
     s = speech if speech is not None else np.zeros(n, dtype=np.float32)
-    l = listen if listen is not None else np.zeros(n, dtype=np.float32)
-    return _fit_duration(s, n), _fit_duration(l, n)
+    listening = listen if listen is not None else np.zeros(n, dtype=np.float32)
+    return _fit_duration(s, n), _fit_duration(listening, n)
 
 
 def _chunk_window(pipeline: Pipeline) -> int:
@@ -98,7 +102,31 @@ def _slice_chunks(audio: np.ndarray, window: int, step: int) -> list[np.ndarray]
     return chunks
 
 
+def _configure_motion_diagnostics(*, console: bool, jsonl_path: Path | None) -> None:
+    if not console and jsonl_path is None:
+        return
+
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter("%(message)s")
+
+    if console:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+    if jsonl_path is not None:
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(jsonl_path, mode="w", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+
 def main() -> None:
+    render_defaults = RenderOptions()
+    crop_defaults = CropConfig()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--speech", type=Path, default=None,
                         help="Speech / self audio (any format)")
@@ -118,10 +146,118 @@ def main() -> None:
         help="Yield each frame as soon as it's ready (default: on). "
              "Use --no-stream-frames for batched mode.",
     )
+    parser.add_argument(
+        "--cfg-self-audio",
+        type=float,
+        default=render_defaults.cfg_self_audio,
+        help="Self/speech-audio guidance strength.",
+    )
+    parser.add_argument(
+        "--cfg-other-audio",
+        type=float,
+        default=render_defaults.cfg_other_audio,
+        help="Other/listening-audio guidance strength.",
+    )
+    parser.add_argument(
+        "--cfg-kp",
+        type=float,
+        default=render_defaults.cfg_kp,
+        help="Source keypoint/identity guidance strength.",
+    )
+    parser.add_argument(
+        "--noise-alpha",
+        type=float,
+        default=render_defaults.noise_alpha,
+        help="AR(1) noise correlation. Higher values correlate adjacent frames more strongly.",
+    )
+    parser.add_argument(
+        "--noise-trunc-z",
+        type=float,
+        default=render_defaults.noise_trunc_z,
+        help="Truncated-normal noise limit. Lower values reduce extreme samples.",
+    )
+    parser.add_argument(
+        "--ode-steps",
+        type=int,
+        default=5,
+        help="Flow integration time points; must be at least 2 (default: 5).",
+    )
+    parser.add_argument(
+        "--crop-scale",
+        type=float,
+        default=crop_defaults.scale,
+        help="Source face crop scale; affects static framing, not temporal smoothing.",
+    )
+    parser.add_argument(
+        "--crop-vx-ratio",
+        type=float,
+        default=crop_defaults.vx_ratio,
+        help="Horizontal source crop offset ratio.",
+    )
+    parser.add_argument(
+        "--crop-vy-ratio",
+        type=float,
+        default=crop_defaults.vy_ratio,
+        help="Vertical source crop offset ratio.",
+    )
+    parser.add_argument(
+        "--crop-rotation",
+        action=argparse.BooleanOptionalAction,
+        default=crop_defaults.flag_do_rot,
+        help="Align the source crop to detected eye/lip rotation (default: on).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Torch random seed for reproducible motion sampling.",
+    )
+    parser.add_argument(
+        "--debug-motion",
+        action="store_true",
+        help="Print JSON motion/keypoint/render diagnostics; reduces throughput.",
+    )
+    parser.add_argument(
+        "--motion-debug-jsonl",
+        type=Path,
+        default=None,
+        help="Write JSONL diagnostics to this path; reduces throughput.",
+    )
     args = parser.parse_args()
 
     if args.speech is None and args.listen is None and args.duration is None:
         parser.error("Provide at least one of --speech, --listen, --duration.")
+    if args.noise_alpha < 0:
+        parser.error("--noise-alpha must be non-negative.")
+    if args.noise_trunc_z <= 0:
+        parser.error("--noise-trunc-z must be greater than zero.")
+    if args.ode_steps < 2:
+        parser.error("--ode-steps must be at least 2.")
+    if args.crop_scale <= 0:
+        parser.error("--crop-scale must be greater than zero.")
+
+    _configure_motion_diagnostics(
+        console=args.debug_motion,
+        jsonl_path=args.motion_debug_jsonl,
+    )
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+
+    record_session(
+        speech=str(args.speech) if args.speech else None,
+        listen=str(args.listen) if args.listen else None,
+        duration=args.duration,
+        avatar=args.avatar,
+        background=args.bg,
+        output=str(args.out),
+        stream_frames=args.stream_frames,
+        seed=args.seed,
+        ode_steps=args.ode_steps,
+        crop_scale=args.crop_scale,
+        crop_vx_ratio=args.crop_vx_ratio,
+        crop_vy_ratio=args.crop_vy_ratio,
+        crop_rotation=args.crop_rotation,
+    )
 
     speech_raw = _load_mono_16k(args.speech) if args.speech else None
     listen_raw = _load_mono_16k(args.listen) if args.listen else None
@@ -135,7 +271,17 @@ def main() -> None:
 
     print(f"Loading pipeline for avatar '{args.avatar}'...")
     print("  (models are downloaded from HuggingFace on first run — this may take a few minutes)")
-    pipeline, registry = Pipeline.from_artifacts(avatar_ids=[args.avatar])
+    crop_config = CropConfig(
+        scale=args.crop_scale,
+        vx_ratio=args.crop_vx_ratio,
+        vy_ratio=args.crop_vy_ratio,
+        flag_do_rot=args.crop_rotation,
+    )
+    pipeline, registry = Pipeline.from_artifacts(
+        avatar_ids=[args.avatar],
+        crop_config=crop_config,
+        n_ode_steps=args.ode_steps,
+    )
     avatar = registry[args.avatar]
 
     window = _chunk_window(pipeline)
@@ -168,13 +314,32 @@ def main() -> None:
 
     mode = "streaming" if args.stream_frames else "batched"
     print(f"Render mode: {mode}")
-    options = RenderOptions(pixel_format="yuv_i420", bg_id=args.bg, stream_frames=args.stream_frames)
+    options = RenderOptions(
+        pixel_format="yuv_i420",
+        bg_id=args.bg,
+        cfg_self_audio=args.cfg_self_audio,
+        cfg_other_audio=args.cfg_other_audio,
+        cfg_kp=args.cfg_kp,
+        noise_alpha=args.noise_alpha,
+        noise_trunc_z=args.noise_trunc_z,
+        stream_frames=args.stream_frames,
+    )
+    print(
+        "Motion options: "
+        f"cfg_self={args.cfg_self_audio:g} "
+        f"cfg_other={args.cfg_other_audio:g} "
+        f"cfg_kp={args.cfg_kp:g} "
+        f"noise_alpha={args.noise_alpha:g} "
+        f"noise_trunc_z={args.noise_trunc_z:g} "
+        f"ode_steps={args.ode_steps} "
+        f"seed={args.seed}"
+    )
     state = None
     produced = 0
     chunk_times: list[float] = []
 
     try:
-        for i, (sp, ls) in enumerate(zip(speech_chunks, listen_chunks)):
+        for i, (sp, ls) in enumerate(zip(speech_chunks, listen_chunks, strict=True)):
             t0 = time.perf_counter()
             chunk = Chunk(audio_speech=sp, audio_listen=ls)
             state, frames_iter = pipeline.process_chunk(avatar, chunk, state, options)

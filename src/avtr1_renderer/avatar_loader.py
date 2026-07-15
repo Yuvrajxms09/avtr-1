@@ -39,6 +39,7 @@ from avtr1_renderer.components.face_detection import detect_faces
 from avtr1_renderer.components.face_landmarks import landmark106, landmark203
 from avtr1_renderer.components.liveportrait.motion_extractor import extract_motion
 from avtr1_renderer.components.source_crop import crop_image, get_default_mask
+from avtr1_renderer.diagnostics import record_avatar_registration
 from avtr1_renderer.models.appearance_extractor import (
     AEInput,
     AEOutput,
@@ -421,6 +422,18 @@ class AvatarLoader:
         )  # (1, 3, 3)
         src_norm_trans_dst_norm = torch.linalg.inv(dst_norm_trans_src_norm)
         M_grid = src_norm_trans_dst_norm[:, :2, :].squeeze(0).contiguous()  # (2, 3)
+
+        record_avatar_registration(
+            avatar_id=avatar_id,
+            kp_info=kp_info,
+            crop_scale=self.crop_cfg.scale,
+            crop_vx_ratio=self.crop_cfg.vx_ratio,
+            crop_vy_ratio=self.crop_cfg.vy_ratio,
+            crop_rotation=self.crop_cfg.flag_do_rot,
+            source_height=h,
+            source_width=w,
+            no_matting=no_matting,
+        )
 
         return Avatar(
             id=avatar_id,

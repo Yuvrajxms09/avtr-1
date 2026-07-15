@@ -125,6 +125,42 @@ ffmpeg -i elena.mp4 -i marcus.mp4 -filter_complex \
 pixi run generate_offline --duration 10
 ```
 
+### Motion controls and diagnostics
+
+Offline inference exposes the existing runtime guidance, noise, integration,
+and source-crop controls directly:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --cfg-self-audio 2.0 \
+  --cfg-other-audio 2.0 \
+  --cfg-kp 3.0 \
+  --noise-alpha 2.0 \
+  --noise-trunc-z 1.2 \
+  --ode-steps 5 \
+  --seed 1234
+```
+
+Use opt-in diagnostics to investigate head jitter, facial geometry changes,
+stitch corrections, and matte occupancy:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --seed 1234 \
+  --motion-debug-jsonl motion-debug.jsonl
+```
+
+Each JSONL event includes a per-chunk `trace_id`. The main stages are
+`avatar_registration`, `audio_chunk`, `motion_prediction`,
+`keypoint_geometry`, and `render_alpha`. Diagnostic metrics synchronize CUDA
+and reduce throughput, so do not use them for performance measurements.
+
 Available avatars are the filenames (without `.png`) inside
 `$AVTR1_LOCAL_STORAGE/v1/avatars_artifacts/reference_frames/` after downloading.
 ---

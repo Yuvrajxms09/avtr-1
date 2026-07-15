@@ -34,33 +34,34 @@ from pathlib import Path
 
 import torch
 
+from avtr1_renderer.avatar_loader import Avatar, CropConfig
 from avtr1_renderer.avtr1_artifact_manager import (
     find_engine_or_onnx,
     get_artifact_manager,
-    get_trt_engine_path, get_storage_root,
+    get_storage_root,
+    get_trt_engine_path,
 )
-from avtr1_renderer.avatar_loader import Avatar
-from avtr1_renderer.backgrounds import load_background
-from avtr1_renderer.frame_sink import pack_frames
 from avtr1_renderer.avtr1_motion_generator import (
     AVTR1MotionGenerator,
     Normalizer,
 )
-from avtr1_renderer.models.decoder import DecoderEngine, DecoderInput, DecoderOutput
-from avtr1_renderer.models.hubert import HubertInput, HubertOutput
+from avtr1_renderer.backgrounds import load_background
+from avtr1_renderer.diagnostics import new_trace_id, record_options, trace_scope
+from avtr1_renderer.frame_sink import pack_frames
 from avtr1_renderer.models.avtr1 import (
     Avtr1DecodeInput,
     Avtr1DecodeOutput,
     Avtr1EncodeInput,
     Avtr1EncodeOutput,
 )
+from avtr1_renderer.models.decoder import DecoderEngine, DecoderInput, DecoderOutput
+from avtr1_renderer.models.hubert import HubertInput, HubertOutput
 from avtr1_renderer.models.matting import MODNetEngine, MODNetInput, MODNetOutput
 from avtr1_renderer.models.stitch import StitchEngine, StitchInput, StitchOutput
 from avtr1_renderer.models.warp import WarpEngine, WarpInput, WarpOutput
 from avtr1_renderer.motion_generator import MotionGenerator
 from avtr1_renderer.renderer import render_chunk, render_chunk_streaming
 from avtr1_renderer.runtime import load_engine
-
 from avtr1_renderer.types import Chunk, FrameIterator, RenderOptions
 
 # Reserved sentinel: skip bg compositing so callers receive raw foreground + matte.
@@ -99,6 +100,8 @@ class Pipeline[StateT]:
         background_paths: dict[str, Path | str] | None = None,
         out_size: tuple[int, int] = (720, 1280),
         download_workers: int = 4,
+        crop_config: CropConfig | None = None,
+        n_ode_steps: int = 5,
     ) -> tuple[Pipeline, dict[str, Avatar]]:
         """Build the Pipeline + avatar registry from downloaded artifacts.
 
@@ -121,6 +124,10 @@ class Pipeline[StateT]:
                               PNGs from the ``backgrounds`` artifact are used.
             out_size:         ``(H, W)`` the pipeline operates at.
             download_workers: Parallel HuggingFace download threads per group.
+            crop_config:      Source-portrait crop parameters. Defaults to
+                              :class:`CropConfig` values.
+            n_ode_steps:      Number of flow-integration time points. Must be
+                              at least 2; the default preserves existing output.
         """
         from avtr1_renderer.avatar_loader import AvatarLoader
 
@@ -219,6 +226,7 @@ class Pipeline[StateT]:
             out_h=out_h,
             out_w=out_w,
             max_dim=max(out_h, out_w),
+            crop_cfg=crop_config,
         )
 
         # --- Avatar registry -------------------------------------------------
@@ -239,6 +247,7 @@ class Pipeline[StateT]:
             encode_engine=encode,
             decode_engine=decode,
             normalizer=normalizer,
+            n_ode_steps=n_ode_steps,
         )
         return (
             cls(
@@ -289,34 +298,39 @@ class Pipeline[StateT]:
             raise KeyError(
                 f"Unknown bg_id {options.bg_id!r}; registered: {sorted(self._backgrounds)}"
             ) from exc
-        motions, next_state = self._motion_generator.generate_chunk(
-            chunk, avatar, state, options
-        )
+        trace_id = new_trace_id()
+        with trace_scope(trace_id):
+            record_options(options)
+            motions, next_state = self._motion_generator.generate_chunk(
+                chunk, avatar, state, options
+            )
 
         def frames_streaming() -> FrameIterator:
-            stream = render_chunk_streaming(
-                motions, avatar, bg,
-                stitch=self._stitch,
-                warp=self._warp,
-                decoder=self._decoder,
-                matting=self._matting,
-            )
-            for rgb, alpha in stream:
-                packed = pack_frames(rgb, alpha, pixel_format=options.pixel_format)
-                yield packed[0]
+            with trace_scope(trace_id):
+                stream = render_chunk_streaming(
+                    motions, avatar, bg,
+                    stitch=self._stitch,
+                    warp=self._warp,
+                    decoder=self._decoder,
+                    matting=self._matting,
+                )
+                for rgb, alpha in stream:
+                    packed = pack_frames(rgb, alpha, pixel_format=options.pixel_format)
+                    yield packed[0]
 
         def frames_batched() -> FrameIterator:
-            rgb, alpha = render_chunk(
-                motions, avatar, bg,
-                stitch=self._stitch,
-                warp=self._warp,
-                decoder=self._decoder,
-                matting=self._matting,
-            )
-            yield from pack_frames(rgb, alpha, pixel_format=options.pixel_format)
+            with trace_scope(trace_id):
+                rgb, alpha = render_chunk(
+                    motions, avatar, bg,
+                    stitch=self._stitch,
+                    warp=self._warp,
+                    decoder=self._decoder,
+                    matting=self._matting,
+                )
+                yield from pack_frames(rgb, alpha, pixel_format=options.pixel_format)
 
         frames = frames_streaming if options.stream_frames else frames_batched
         return next_state, frames()
 
 
-__all__ = ["Pipeline", "TRANSPARENT_BG_ID"]
+__all__ = ["TRANSPARENT_BG_ID", "Pipeline"]

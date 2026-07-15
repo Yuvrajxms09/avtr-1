@@ -67,13 +67,14 @@ from avtr1_renderer.avatar_loader import Avatar
 from avtr1_renderer.components.hubert import run_hubert
 from avtr1_renderer.components.liveportrait.motion_stitch import MotionFrame
 from avtr1_renderer.constants import LIPSYNC_COORDS
-from avtr1_renderer.models.hubert import HubertEngine
+from avtr1_renderer.diagnostics import record_audio_chunk, record_motion_prediction
 from avtr1_renderer.models.avtr1 import (
     Avtr1DecodeEngine,
     Avtr1DecodeInput,
     Avtr1EncodeEngine,
     Avtr1EncodeInput,
 )
+from avtr1_renderer.models.hubert import HubertEngine
 from avtr1_renderer.types import Chunk, RenderOptions
 
 N_LIPSYNC = len(LIPSYNC_COORDS)
@@ -300,6 +301,8 @@ class AVTR1MotionGenerator:
         audio_shift: int = 80,
         n_ode_steps: int = 5,
     ) -> None:
+        if n_ode_steps < 2:
+            raise ValueError(f"n_ode_steps must be at least 2, got {n_ode_steps}")
         assert past_size % chunk_size == 0, (
             f"past_size ({past_size}) must be divisible by chunk_size ({chunk_size})"
         )
@@ -388,6 +391,7 @@ class AVTR1MotionGenerator:
         chunk_listen = torch.from_numpy(audio_chunk.audio_listen).to(
             device, dtype=torch.float32, non_blocking=True
         )
+        record_audio_chunk(chunk_speech, chunk_listen)
         full_speech = torch.cat([state.audio_prev_speech, chunk_speech], dim=0)
         full_listen = torch.cat([state.audio_prev_listen, chunk_listen], dim=0)
 
@@ -500,6 +504,7 @@ class AVTR1MotionGenerator:
             x.add_(v_buf, alpha=dt)
         # ``x`` is the normalised motion prediction for this chunk.
         motions = self._motion_to_frames(x)
+        record_motion_prediction(x, past_cond[:, -1], motions)
 
         # ---- next state -------------------------------------------------
         # past_cond: append this chunk's normalised motion, drop oldest.
