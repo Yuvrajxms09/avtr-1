@@ -12,6 +12,7 @@ Usage:
     pixi run generate_offline --speech s.wav --bg plain_white --no-mux                # video only
     pixi run generate_offline --speech s.wav --bg plain_white --stream-frames         # per-frame (default)
     pixi run generate_offline --speech s.wav --bg plain_white --no-stream-frames      # batched mode
+    pixi run generate_offline --speech s.wav --avatar custom --bg plain_white --native-size
 
 Requirements:
     AVTR1 TRT engines must be built first:
@@ -32,7 +33,9 @@ import soxr
 import torch
 
 from avtr1_renderer.avatar_loader import CropConfig
+from avtr1_renderer.avtr1_artifact_manager import get_artifact_manager
 from avtr1_renderer.diagnostics import LOGGER_NAME, record_session
+from avtr1_renderer.frame_size import read_native_output_size
 from avtr1_renderer.pipeline import Pipeline
 from avtr1_renderer.types import Chunk, RenderOptions
 
@@ -147,6 +150,12 @@ def main() -> None:
              "Use --no-stream-frames for batched mode.",
     )
     parser.add_argument(
+        "--native-size",
+        action="store_true",
+        help="Render at the source portrait's native size instead of 1280x720. "
+        "Odd dimensions are reduced by one pixel for YUV420 encoding.",
+    )
+    parser.add_argument(
         "--cfg-self-audio",
         type=float,
         default=render_defaults.cfg_self_audio,
@@ -236,6 +245,18 @@ def main() -> None:
     if args.crop_scale <= 0:
         parser.error("--crop-scale must be greater than zero.")
 
+    out_size = (720, 1280)
+    if args.native_size:
+        portraits_dir = get_artifact_manager().get_artifact_path("reference_frames")
+        portrait_path = portraits_dir / f"{args.avatar}.png"
+        if not portrait_path.is_file():
+            parser.error(f"No portrait at {portrait_path}")
+        out_size = read_native_output_size(portrait_path)
+        print(
+            f"Native output size: {out_size[1]}x{out_size[0]} "
+            "(width x height, YUV420-aligned)"
+        )
+
     _configure_motion_diagnostics(
         console=args.debug_motion,
         jsonl_path=args.motion_debug_jsonl,
@@ -257,6 +278,9 @@ def main() -> None:
         crop_vx_ratio=args.crop_vx_ratio,
         crop_vy_ratio=args.crop_vy_ratio,
         crop_rotation=args.crop_rotation,
+        native_size=args.native_size,
+        output_height=out_size[0],
+        output_width=out_size[1],
     )
 
     speech_raw = _load_mono_16k(args.speech) if args.speech else None
@@ -281,6 +305,7 @@ def main() -> None:
         avatar_ids=[args.avatar],
         crop_config=crop_config,
         n_ode_steps=args.ode_steps,
+        out_size=out_size,
     )
     avatar = registry[args.avatar]
 

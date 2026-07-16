@@ -163,6 +163,29 @@ and reduce throughput, so do not use them for performance measurements.
 
 Available avatars are the filenames (without `.png`) inside
 `$AVTR1_LOCAL_STORAGE/v1/avatars_artifacts/reference_frames/` after downloading.
+
+### Native-size portraits
+
+The default offline canvas is 1280x720. Portraits with a different aspect
+ratio are resized to that canvas by the renderer. For testing an arbitrary
+portrait without changing its aspect ratio, render at the portrait's native
+size:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --avatar custom_portrait \
+  --bg plain_white \
+  --native-size \
+  --out custom_portrait.mp4
+```
+
+The portrait must exist as `custom_portrait.png` in the `reference_frames`
+artifact directory. Native width and height are used as the output canvas;
+odd dimensions are reduced by one pixel because YUV420 video requires even
+dimensions. Large source images increase renderer memory usage and output
+encoding cost.
+
 ---
 
 ## 2. Performance
