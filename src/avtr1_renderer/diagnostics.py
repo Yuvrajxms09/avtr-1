@@ -23,10 +23,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from avtr1_renderer.constants import LIPSYNC_COORDS
-from avtr1_renderer.types import KPInfo, RenderOptions
+from avtr1_renderer.types import KPInfo, MotionStabilizationOptions, RenderOptions
 
 if TYPE_CHECKING:
     from avtr1_renderer.components.liveportrait.motion_stitch import MotionFrame
+    from avtr1_renderer.motion_stabilizer import MotionStabilizationResult
 
 LOGGER_NAME = "avtr1_renderer.motion_debug"
 
@@ -90,6 +91,30 @@ def record_options(options: RenderOptions) -> None:
             "noise_alpha": options.noise_alpha,
             "noise_trunc_z": options.noise_trunc_z,
             "stream_frames": options.stream_frames,
+            "motion_stabilization": {
+                "mode": options.stabilization.mode,
+                "rotation_acceleration_threshold_deg": (
+                    options.stabilization.rotation_acceleration_threshold_deg
+                ),
+                "rotation_max_correction_deg": (options.stabilization.rotation_max_correction_deg),
+                "rotation_strength": options.stabilization.rotation_strength,
+                "expression_acceleration_threshold_z": (
+                    options.stabilization.expression_acceleration_threshold_z
+                ),
+                "expression_max_correction_z": (options.stabilization.expression_max_correction_z),
+                "expression_strength": options.stabilization.expression_strength,
+                "expression_active_coordinates": (
+                    None
+                    if options.stabilization.expression_coordinate_weights is None
+                    else [
+                        index
+                        for index, weight in enumerate(
+                            options.stabilization.expression_coordinate_weights
+                        )
+                        if weight > 0
+                    ]
+                ),
+            },
         },
     )
 
@@ -198,6 +223,85 @@ def record_motion_prediction(
     )
 
 
+def _row_norms(values: torch.Tensor) -> torch.Tensor:
+    if values.numel() == 0:
+        return values.new_empty(0)
+    return torch.linalg.vector_norm(values, dim=-1)
+
+
+def record_motion_stabilization(
+    options: MotionStabilizationOptions,
+    result: MotionStabilizationResult,
+) -> None:
+    if not enabled():
+        return
+
+    radians_to_degrees = 180.0 / math.pi
+    rotation_correction_deg = _row_norms(result.rotation_correction) * radians_to_degrees
+    expression_abs_correction = result.expression_correction.abs()
+    expression_coordinate_max = (
+        expression_abs_correction.amax(dim=0)
+        if expression_abs_correction.numel()
+        else expression_abs_correction.new_empty(0)
+    )
+    expression_interventions = expression_coordinate_max > 1e-6
+    rotation_intervention_mask = rotation_correction_deg > 1e-6
+    expression_intervention_mask = expression_abs_correction > 1e-6
+    expression_frame_interventions = expression_intervention_mask.any(dim=-1)
+
+    _emit(
+        "motion_stabilization",
+        {
+            "mode": options.mode,
+            "state_reset": result.state_reset,
+            "rotation": {
+                "raw_rotvec_rad": result.raw_rotation.detach().float().tolist(),
+                "corrected_rotvec_rad": result.corrected_rotation.detach().float().tolist(),
+                "raw_velocity_deg": _series(
+                    _row_norms(result.raw_rotation_velocity) * radians_to_degrees
+                ),
+                "corrected_velocity_deg": _series(
+                    _row_norms(result.corrected_rotation_velocity) * radians_to_degrees
+                ),
+                "raw_acceleration_deg": _series(
+                    _row_norms(result.raw_rotation_acceleration) * radians_to_degrees
+                ),
+                "corrected_acceleration_deg": _series(
+                    _row_norms(result.corrected_rotation_acceleration) * radians_to_degrees
+                ),
+                "correction_deg": _series(rotation_correction_deg),
+                "intervention_frames": int(rotation_intervention_mask.sum().item()),
+                "intervention_frame_indices": rotation_intervention_mask.nonzero(as_tuple=False)
+                .flatten()
+                .tolist(),
+            },
+            "expression": {
+                "raw_normalized": result.raw_expression.detach().float().tolist(),
+                "corrected_normalized": (result.corrected_expression.detach().float().tolist()),
+                "raw_velocity_l2": _series(_row_norms(result.raw_expression_velocity)),
+                "corrected_velocity_l2": _series(_row_norms(result.corrected_expression_velocity)),
+                "raw_acceleration_l2": _series(_row_norms(result.raw_expression_acceleration)),
+                "corrected_acceleration_l2": _series(
+                    _row_norms(result.corrected_expression_acceleration)
+                ),
+                "correction_l2": _series(_row_norms(result.expression_correction)),
+                "coordinate_max_abs_correction_z": _series(expression_coordinate_max),
+                "intervention_frames": int(expression_frame_interventions.sum().item()),
+                "intervention_frame_indices": expression_frame_interventions.nonzero(as_tuple=False)
+                .flatten()
+                .tolist(),
+                "intervention_coordinates": expression_interventions.nonzero(as_tuple=False)
+                .flatten()
+                .tolist(),
+                "intervention_coordinates_by_frame": [
+                    coordinates.nonzero(as_tuple=False).flatten().tolist()
+                    for coordinates in expression_intervention_mask
+                ],
+            },
+        },
+    )
+
+
 def _keypoint_geometry(keypoints: torch.Tensor) -> dict[str, Any]:
     xy = keypoints[..., :2]
     centers = xy.mean(dim=1)
@@ -273,6 +377,7 @@ __all__ = [
     "record_avatar_registration",
     "record_keypoint_geometry",
     "record_motion_prediction",
+    "record_motion_stabilization",
     "record_options",
     "record_render_alpha",
     "record_session",

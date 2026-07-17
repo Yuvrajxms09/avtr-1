@@ -158,8 +158,58 @@ pixi run generate_offline \
 
 Each JSONL event includes a per-chunk `trace_id`. The main stages are
 `avatar_registration`, `audio_chunk`, `motion_prediction`,
-`keypoint_geometry`, and `render_alpha`. Diagnostic metrics synchronize CUDA
-and reduce throughput, so do not use them for performance measurements.
+`motion_stabilization`, `keypoint_geometry`, and `render_alpha`. Diagnostic
+metrics synchronize CUDA and reduce throughput, so do not use them for
+performance measurements.
+
+### Experimental motion stabilization
+
+Temporal guards are disabled by default and do not alter existing inference.
+The rotation guard suppresses isolated one-frame reversals in the predicted
+head rotation while leaving sustained motion untouched:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --motion-stabilization rotation \
+  --rotation-acceleration-threshold-deg 0.75 \
+  --rotation-max-correction-deg 1.5 \
+  --motion-debug-jsonl rotation-debug.jsonl \
+  --out rotation-guard.mp4
+```
+
+Expression coordinates are learned and do not have safe anatomical labels.
+Generate sensitivity artifacts before enabling expression stabilization:
+
+```bash
+pixi run analyze-expression-sensitivity \
+  --avatars maria,elena,marcus \
+  --perturbation-z 0.5 \
+  --out expression-sensitivity
+```
+
+The analyzer renders positive/negative perturbations for every coordinate,
+writes pixel heatmaps plus post-stitch keypoint and face-radius metrics, and creates
+`expression_profile.review.json`. Its 39 weights intentionally start at zero;
+review the contact sheets and set only coordinates that are safe to constrain.
+Then run expression-only or combined experiments:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --motion-stabilization both \
+  --expression-profile expression-sensitivity/expression_profile.review.json \
+  --motion-debug-jsonl combined-debug.jsonl \
+  --out combined-guards.mp4
+```
+
+Stabilization corrects only the motion copy sent to the renderer; the model's
+autoregressive history remains unchanged. Filter carry is serialized with the
+normal renderer state, so corrections remain continuous across API chunks.
 
 Available avatars are the filenames (without `.png`) inside
 `$AVTR1_LOCAL_STORAGE/v1/avatars_artifacts/reference_frames/` after downloading.

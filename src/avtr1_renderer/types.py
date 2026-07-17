@@ -21,8 +21,9 @@ Shape philosophy:
   stream without buffering.
 """
 
+import math
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -109,6 +110,71 @@ class Frame:
 
 FrameIterator = Iterator[Frame]
 
+MotionStabilizationMode = Literal["none", "rotation", "expression", "both"]
+
+
+@dataclass(slots=True, frozen=True)
+class MotionStabilizationOptions:
+    """Experimental temporal guards applied to normalized motion output.
+
+    The guards suppress isolated acceleration spikes; they are not general
+    low-pass filters. Disabled defaults are deliberately output-preserving.
+    Expression filtering operates in the model's z-score-normalized space so
+    one threshold has comparable meaning across all 39 coordinates.
+    """
+
+    mode: MotionStabilizationMode = "none"
+
+    rotation_acceleration_threshold_deg: float = 0.75
+    rotation_max_correction_deg: float = 1.5
+    rotation_strength: float = 1.0
+
+    expression_acceleration_threshold_z: float = 1.5
+    expression_max_correction_z: float = 2.0
+    expression_strength: float = 1.0
+    expression_coordinate_weights: tuple[float, ...] | None = None
+
+    @property
+    def rotation_enabled(self) -> bool:
+        return self.mode in {"rotation", "both"}
+
+    @property
+    def expression_enabled(self) -> bool:
+        return self.mode in {"expression", "both"}
+
+    def validate(self, *, expression_coordinates: int) -> None:
+        if self.mode not in {"none", "rotation", "expression", "both"}:
+            raise ValueError(f"Unknown motion stabilization mode: {self.mode!r}")
+        for name, value in (
+            ("rotation_acceleration_threshold_deg", self.rotation_acceleration_threshold_deg),
+            ("rotation_max_correction_deg", self.rotation_max_correction_deg),
+            ("expression_acceleration_threshold_z", self.expression_acceleration_threshold_z),
+            ("expression_max_correction_z", self.expression_max_correction_z),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be greater than zero, got {value}")
+        for name, value in (
+            ("rotation_strength", self.rotation_strength),
+            ("expression_strength", self.expression_strength),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {value}")
+
+        weights = self.expression_coordinate_weights
+        if self.expression_enabled and weights is None:
+            raise ValueError(
+                "Expression stabilization requires an explicit coordinate profile; "
+                "run scripts/analyze_expression_sensitivity.py first"
+            )
+        if weights is not None:
+            if len(weights) != expression_coordinates:
+                raise ValueError(
+                    "expression_coordinate_weights must contain exactly "
+                    f"{expression_coordinates} values, got {len(weights)}"
+                )
+            if any(not math.isfinite(weight) or not 0.0 <= weight <= 1.0 for weight in weights):
+                raise ValueError("expression coordinate weights must all be in [0, 1]")
+
 
 @dataclass(slots=True, frozen=True)
 class RenderOptions:
@@ -156,7 +222,18 @@ class RenderOptions:
     noise_alpha: float = 2.0
     noise_trunc_z: float = 1.2
 
+    # --- Optional post-prediction temporal guards ---
+    stabilization: MotionStabilizationOptions = field(default_factory=MotionStabilizationOptions)
+
     stream_frames: bool = True
 
 
-__all__ = ["Chunk", "Frame", "FrameIterator", "KPInfo", "RenderOptions"]
+__all__ = [
+    "Chunk",
+    "Frame",
+    "FrameIterator",
+    "KPInfo",
+    "MotionStabilizationMode",
+    "MotionStabilizationOptions",
+    "RenderOptions",
+]

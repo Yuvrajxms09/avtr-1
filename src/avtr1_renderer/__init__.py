@@ -19,6 +19,20 @@ Quickstart::
 
 from avtr1_renderer.avatar_loader import Avatar
 from avtr1_renderer.pipeline import Pipeline
-from avtr1_renderer.types import Chunk, Frame, FrameIterator, RenderOptions
+from avtr1_renderer.types import (
+    Chunk,
+    Frame,
+    FrameIterator,
+    MotionStabilizationOptions,
+    RenderOptions,
+)
 
-__all__ = ["Avatar", "Chunk", "Frame", "FrameIterator", "Pipeline", "RenderOptions"]
+__all__ = [
+    "Avatar",
+    "Chunk",
+    "Frame",
+    "FrameIterator",
+    "MotionStabilizationOptions",
+    "Pipeline",
+    "RenderOptions",
+]

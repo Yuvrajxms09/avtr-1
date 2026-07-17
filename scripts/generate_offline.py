@@ -22,6 +22,7 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from pathlib import Path
@@ -34,10 +35,11 @@ import torch
 
 from avtr1_renderer.avatar_loader import CropConfig
 from avtr1_renderer.avtr1_artifact_manager import get_artifact_manager
+from avtr1_renderer.constants import LIPSYNC_COORDS
 from avtr1_renderer.diagnostics import LOGGER_NAME, record_session
 from avtr1_renderer.frame_size import read_native_output_size
 from avtr1_renderer.pipeline import Pipeline
-from avtr1_renderer.types import Chunk, RenderOptions
+from avtr1_renderer.types import Chunk, MotionStabilizationOptions, RenderOptions
 
 SAMPLE_RATE = 16_000
 FPS = 25
@@ -127,27 +129,65 @@ def _configure_motion_diagnostics(*, console: bool, jsonl_path: Path | None) -> 
         logger.addHandler(file_handler)
 
 
+def _load_expression_profile(path: Path) -> tuple[float, ...]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not load expression profile {path}: {exc}") from exc
+    if payload.get("version") != 1:
+        raise ValueError(f"Expression profile {path} must have version=1")
+    weights = payload.get("coordinate_weights")
+    if not isinstance(weights, list):
+        raise ValueError(f"Expression profile {path} must contain coordinate_weights")
+    expected = len(LIPSYNC_COORDS)
+    if len(weights) != expected:
+        raise ValueError(
+            f"Expression profile {path} must contain {expected} weights, got {len(weights)}"
+        )
+    try:
+        parsed = tuple(float(weight) for weight in weights)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Expression profile {path} contains non-numeric weights") from exc
+    if any(not 0.0 <= weight <= 1.0 for weight in parsed):
+        raise ValueError(f"Expression profile {path} weights must all be in [0, 1]")
+    return parsed
+
+
 def main() -> None:
     render_defaults = RenderOptions()
     crop_defaults = CropConfig()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--speech", type=Path, default=None,
-                        help="Speech / self audio (any format)")
-    parser.add_argument("--listen", type=Path, default=None,
-                        help="Listen / other audio (any format)")
-    parser.add_argument("--duration", type=float, default=None,
-                        help="Force render duration in seconds; audio is trimmed/padded to fit")
+    parser.add_argument(
+        "--speech", type=Path, default=None, help="Speech / self audio (any format)"
+    )
+    parser.add_argument(
+        "--listen", type=Path, default=None, help="Listen / other audio (any format)"
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="Force render duration in seconds; audio is trimmed/padded to fit",
+    )
     parser.add_argument("--avatar", default="maria", help="Avatar ID to render")
     parser.add_argument("--out", type=Path, default=Path("demo_output.mp4"))
-    parser.add_argument("--bg", required=True, help="Background ID (must match a file in the backgrounds artifact, e.g. 'plain_white')")
     parser.add_argument(
-        "--no-mux", dest="mux", action="store_false",
+        "--bg",
+        required=True,
+        help="Background ID (must match a file in the backgrounds artifact, e.g. 'plain_white')",
+    )
+    parser.add_argument(
+        "--no-mux",
+        dest="mux",
+        action="store_false",
         help="Don't mux the speech audio into the output video.",
     )
     parser.add_argument(
-        "--stream-frames", action=argparse.BooleanOptionalAction, default=True,
+        "--stream-frames",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Yield each frame as soon as it's ready (default: on). "
-             "Use --no-stream-frames for batched mode.",
+        "Use --no-stream-frames for batched mode.",
     )
     parser.add_argument(
         "--native-size",
@@ -232,6 +272,54 @@ def main() -> None:
         default=None,
         help="Write JSONL diagnostics to this path; reduces throughput.",
     )
+    parser.add_argument(
+        "--motion-stabilization",
+        choices=("none", "rotation", "expression", "both"),
+        default="none",
+        help="Experimental render-only motion spike guard (default: none).",
+    )
+    parser.add_argument(
+        "--rotation-acceleration-threshold-deg",
+        type=float,
+        default=0.75,
+        help="Rotation residual allowed per frame before correction, in degrees.",
+    )
+    parser.add_argument(
+        "--rotation-max-correction-deg",
+        type=float,
+        default=1.5,
+        help="Maximum rotation correction applied to one frame, in degrees.",
+    )
+    parser.add_argument(
+        "--rotation-stabilization-strength",
+        type=float,
+        default=1.0,
+        help="Rotation correction blend in [0, 1].",
+    )
+    parser.add_argument(
+        "--expression-profile",
+        type=Path,
+        default=None,
+        help="Versioned JSON profile with 39 expression coordinate weights.",
+    )
+    parser.add_argument(
+        "--expression-acceleration-threshold-z",
+        type=float,
+        default=1.5,
+        help="Normalized expression residual allowed before correction.",
+    )
+    parser.add_argument(
+        "--expression-max-correction-z",
+        type=float,
+        default=2.0,
+        help="Maximum normalized expression correction per coordinate/frame.",
+    )
+    parser.add_argument(
+        "--expression-stabilization-strength",
+        type=float,
+        default=1.0,
+        help="Expression correction blend in [0, 1].",
+    )
     args = parser.parse_args()
 
     if args.speech is None and args.listen is None and args.duration is None:
@@ -244,6 +332,42 @@ def main() -> None:
         parser.error("--ode-steps must be at least 2.")
     if args.crop_scale <= 0:
         parser.error("--crop-scale must be greater than zero.")
+    for flag, value in (
+        ("--rotation-acceleration-threshold-deg", args.rotation_acceleration_threshold_deg),
+        ("--rotation-max-correction-deg", args.rotation_max_correction_deg),
+        ("--expression-acceleration-threshold-z", args.expression_acceleration_threshold_z),
+        ("--expression-max-correction-z", args.expression_max_correction_z),
+    ):
+        if value <= 0:
+            parser.error(f"{flag} must be greater than zero.")
+    for flag, value in (
+        ("--rotation-stabilization-strength", args.rotation_stabilization_strength),
+        ("--expression-stabilization-strength", args.expression_stabilization_strength),
+    ):
+        if not 0.0 <= value <= 1.0:
+            parser.error(f"{flag} must be in [0, 1].")
+    expression_weights = None
+    if args.expression_profile is not None:
+        try:
+            expression_weights = _load_expression_profile(args.expression_profile)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.motion_stabilization in {"expression", "both"} and expression_weights is None:
+        parser.error("--expression-profile is required when expression stabilization is enabled")
+    stabilization = MotionStabilizationOptions(
+        mode=args.motion_stabilization,
+        rotation_acceleration_threshold_deg=args.rotation_acceleration_threshold_deg,
+        rotation_max_correction_deg=args.rotation_max_correction_deg,
+        rotation_strength=args.rotation_stabilization_strength,
+        expression_acceleration_threshold_z=args.expression_acceleration_threshold_z,
+        expression_max_correction_z=args.expression_max_correction_z,
+        expression_strength=args.expression_stabilization_strength,
+        expression_coordinate_weights=expression_weights,
+    )
+    try:
+        stabilization.validate(expression_coordinates=len(LIPSYNC_COORDS))
+    except ValueError as exc:
+        parser.error(str(exc))
 
     out_size = (720, 1280)
     if args.native_size:
@@ -252,10 +376,7 @@ def main() -> None:
         if not portrait_path.is_file():
             parser.error(f"No portrait at {portrait_path}")
         out_size = read_native_output_size(portrait_path)
-        print(
-            f"Native output size: {out_size[1]}x{out_size[0]} "
-            "(width x height, YUV420-aligned)"
-        )
+        print(f"Native output size: {out_size[1]}x{out_size[0]} (width x height, YUV420-aligned)")
 
     _configure_motion_diagnostics(
         console=args.debug_motion,
@@ -281,6 +402,10 @@ def main() -> None:
         native_size=args.native_size,
         output_height=out_size[0],
         output_width=out_size[1],
+        motion_stabilization=args.motion_stabilization,
+        expression_profile=(
+            str(args.expression_profile) if args.expression_profile is not None else None
+        ),
     )
 
     speech_raw = _load_mono_16k(args.speech) if args.speech else None
@@ -316,8 +441,10 @@ def main() -> None:
     speech_chunks = _slice_chunks(speech, window, step)
     listen_chunks = _slice_chunks(listen, window, step)
     n_chunks = len(speech_chunks)
-    print(f"Chunks: {n_chunks}  frames: {n_chunks * frames_per_chunk}  "
-          f"({n_chunks * frames_per_chunk / FPS:.1f}s at {FPS} fps)")
+    print(
+        f"Chunks: {n_chunks}  frames: {n_chunks * frames_per_chunk}  "
+        f"({n_chunks * frames_per_chunk / FPS:.1f}s at {FPS} fps)"
+    )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     out_h, out_w = avatar.source.shape[-2:]
@@ -347,6 +474,7 @@ def main() -> None:
         cfg_kp=args.cfg_kp,
         noise_alpha=args.noise_alpha,
         noise_trunc_z=args.noise_trunc_z,
+        stabilization=stabilization,
         stream_frames=args.stream_frames,
     )
     print(
@@ -358,6 +486,13 @@ def main() -> None:
         f"noise_trunc_z={args.noise_trunc_z:g} "
         f"ode_steps={args.ode_steps} "
         f"seed={args.seed}"
+    )
+    print(
+        "Stabilization: "
+        f"mode={args.motion_stabilization} "
+        f"rotation_threshold={args.rotation_acceleration_threshold_deg:g}deg "
+        f"rotation_max={args.rotation_max_correction_deg:g}deg "
+        f"expression_profile={args.expression_profile or 'none'}"
     )
     state = None
     produced = 0

@@ -37,11 +37,16 @@ from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from avtr1_renderer.api.load_balancing import keep_alive_worker
-from avtr1_renderer.components.pixel_format import PixelFormat, get_bytes_per_frame
 from avtr1_renderer.avtr1_motion_generator import state_from_safetensors, state_to_safetensors
-from avtr1_renderer.pipeline import Pipeline, TRANSPARENT_BG_ID
-
-from avtr1_renderer.types import Chunk, RenderOptions
+from avtr1_renderer.components.pixel_format import PixelFormat, get_bytes_per_frame
+from avtr1_renderer.constants import LIPSYNC_COORDS
+from avtr1_renderer.pipeline import TRANSPARENT_BG_ID, Pipeline
+from avtr1_renderer.types import (
+    Chunk,
+    MotionStabilizationMode,
+    MotionStabilizationOptions,
+    RenderOptions,
+)
 from avtr1_renderer.utils.asyncio import run_in_thread
 from avtr1_renderer.utils.cuda_health import CudaHealthChecker
 
@@ -69,14 +74,18 @@ def _build_chunk(
     fut_n: int,
 ) -> Chunk:
     cur, fut, curl, futl = audio_bytes
-    speech = np.concatenate([
-        _bytes_to_float32(cur, cur_n, "speech_current"),
-        _bytes_to_float32(fut, fut_n, "speech_future"),
-    ])
-    listen = np.concatenate([
-        _bytes_to_float32(curl, cur_n, "listen_current"),
-        _bytes_to_float32(futl, fut_n, "listen_future"),
-    ])
+    speech = np.concatenate(
+        [
+            _bytes_to_float32(cur, cur_n, "speech_current"),
+            _bytes_to_float32(fut, fut_n, "speech_future"),
+        ]
+    )
+    listen = np.concatenate(
+        [
+            _bytes_to_float32(curl, cur_n, "listen_current"),
+            _bytes_to_float32(futl, fut_n, "listen_future"),
+        ]
+    )
     return Chunk(audio_speech=speech, audio_listen=listen)
 
 
@@ -127,6 +136,7 @@ async def lifespan(app: FastAPI):
 
     # Auto-discover all portrait PNGs in reference_frames.
     from avtr1_renderer.avtr1_artifact_manager import get_artifact_manager
+
     mgr = get_artifact_manager()
     portraits_dir = Path(mgr.get_artifact_path("reference_frames"))
     avatar_ids = [p.stem for p in sorted(portraits_dir.glob("*.png"))]
@@ -157,6 +167,32 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _parse_expression_weights(value: str | None) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    try:
+        weights = tuple(float(part.strip()) for part in value.split(","))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="expression_stabilization_weights must be comma-separated numbers",
+        ) from exc
+    if len(weights) != len(LIPSYNC_COORDS):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "expression_stabilization_weights must contain exactly "
+                f"{len(LIPSYNC_COORDS)} values"
+            ),
+        )
+    if any(not 0.0 <= weight <= 1.0 for weight in weights):
+        raise HTTPException(
+            status_code=422,
+            detail="expression_stabilization_weights values must be in [0, 1]",
+        )
+    return weights
+
+
 @app.post("/process-audio-v3")
 async def process_audio_v3(
     request: Request,
@@ -173,6 +209,14 @@ async def process_audio_v3(
     cfg_kp: float = 4.0,
     noise_alpha: float = 2.0,
     noise_trunc_z: float = 1.2,
+    motion_stabilization: MotionStabilizationMode = "none",
+    rotation_acceleration_threshold_deg: float = 0.75,
+    rotation_max_correction_deg: float = 1.5,
+    rotation_stabilization_strength: float = 1.0,
+    expression_acceleration_threshold_z: float = 1.5,
+    expression_max_correction_z: float = 2.0,
+    expression_stabilization_strength: float = 1.0,
+    expression_stabilization_weights: str | None = None,
 ) -> StreamingResponse:
     pipeline: Pipeline = request.app.state.pipeline
     registry: dict = request.app.state.registry
@@ -198,6 +242,21 @@ async def process_audio_v3(
     if state_blob_in is not None and len(state_blob_in) == 0:
         state_blob_in = None
 
+    stabilization = MotionStabilizationOptions(
+        mode=motion_stabilization,
+        rotation_acceleration_threshold_deg=rotation_acceleration_threshold_deg,
+        rotation_max_correction_deg=rotation_max_correction_deg,
+        rotation_strength=rotation_stabilization_strength,
+        expression_acceleration_threshold_z=expression_acceleration_threshold_z,
+        expression_max_correction_z=expression_max_correction_z,
+        expression_strength=expression_stabilization_strength,
+        expression_coordinate_weights=_parse_expression_weights(expression_stabilization_weights),
+    )
+    try:
+        stabilization.validate(expression_coordinates=len(LIPSYNC_COORDS))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     options = RenderOptions(
         pixel_format=pixel_format,
         bg_id=bg_id,
@@ -206,6 +265,7 @@ async def process_audio_v3(
         cfg_kp=cfg_kp,
         noise_alpha=noise_alpha,
         noise_trunc_z=noise_trunc_z,
+        stabilization=stabilization,
     )
 
     loop = asyncio.get_running_loop()
@@ -286,7 +346,9 @@ async def health(request: Request):
 
 class _DropSuccessfulAccess(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        status = record.args[4] if isinstance(record.args, tuple) and len(record.args) >= 5 else None
+        status = (
+            record.args[4] if isinstance(record.args, tuple) and len(record.args) >= 5 else None
+        )
         if isinstance(status, int) and 200 <= status < 400:
             return False
         return True

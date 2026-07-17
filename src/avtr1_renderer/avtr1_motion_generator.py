@@ -67,7 +67,11 @@ from avtr1_renderer.avatar_loader import Avatar
 from avtr1_renderer.components.hubert import run_hubert
 from avtr1_renderer.components.liveportrait.motion_stitch import MotionFrame
 from avtr1_renderer.constants import LIPSYNC_COORDS
-from avtr1_renderer.diagnostics import record_audio_chunk, record_motion_prediction
+from avtr1_renderer.diagnostics import (
+    record_audio_chunk,
+    record_motion_prediction,
+    record_motion_stabilization,
+)
 from avtr1_renderer.models.avtr1 import (
     Avtr1DecodeEngine,
     Avtr1DecodeInput,
@@ -75,6 +79,10 @@ from avtr1_renderer.models.avtr1 import (
     Avtr1EncodeInput,
 )
 from avtr1_renderer.models.hubert import HubertEngine
+from avtr1_renderer.motion_stabilizer import (
+    MotionStabilizerState,
+    stabilize_normalized_motion,
+)
 from avtr1_renderer.types import Chunk, RenderOptions
 
 N_LIPSYNC = len(LIPSYNC_COORDS)
@@ -104,24 +112,56 @@ def state_to_safetensors(state: AVTR1State) -> bytes:
     }
     if state.noise_shared is not None:
         tensors["noise_shared"] = state.noise_shared
+    stabilizer = state.stabilizer
+    if stabilizer is not None:
+        tensors["stabilizer_mode_code"] = torch.tensor(
+            stabilizer.mode_code,
+            dtype=torch.int64,
+            device=state.past_cond.device,
+        )
+        for name in (
+            "rotation_position",
+            "rotation_velocity",
+            "rotation_raw_position",
+            "rotation_raw_velocity",
+            "expression_position",
+            "expression_velocity",
+            "expression_raw_position",
+            "expression_raw_velocity",
+        ):
+            value = getattr(stabilizer, name)
+            if value is not None:
+                tensors[f"stabilizer_{name}"] = value
     return save(tensors)
 
 
-def state_from_safetensors(
-    blob: bytes, *, device: str | torch.device = "cuda"
-) -> AVTR1State:
+def state_from_safetensors(blob: bytes, *, device: str | torch.device = "cuda") -> AVTR1State:
     """Inverse of :func:`state_to_safetensors`. Loads each tensor
     directly onto ``device`` (default CUDA)."""
     from safetensors.torch import load
 
     tensors = load(blob)
     moved = {k: v.to(device, non_blocking=True) for k, v in tensors.items()}
+    stabilizer = None
+    if "stabilizer_mode_code" in moved:
+        stabilizer = MotionStabilizerState(
+            mode_code=int(moved["stabilizer_mode_code"].item()),
+            rotation_position=moved.get("stabilizer_rotation_position"),
+            rotation_velocity=moved.get("stabilizer_rotation_velocity"),
+            rotation_raw_position=moved.get("stabilizer_rotation_raw_position"),
+            rotation_raw_velocity=moved.get("stabilizer_rotation_raw_velocity"),
+            expression_position=moved.get("stabilizer_expression_position"),
+            expression_velocity=moved.get("stabilizer_expression_velocity"),
+            expression_raw_position=moved.get("stabilizer_expression_raw_position"),
+            expression_raw_velocity=moved.get("stabilizer_expression_raw_velocity"),
+        )
     return AVTR1State(
         audio_prev_speech=moved["audio_prev_speech"],
         audio_prev_listen=moved["audio_prev_listen"],
         audio_features=moved["audio_features"],
         past_cond=moved["past_cond"],
         noise_shared=moved.get("noise_shared"),
+        stabilizer=stabilizer,
     )
 
 
@@ -144,11 +184,14 @@ class AVTR1State:
     place state ever touches the host.
     """
 
-    audio_prev_speech: torch.Tensor       # (chunksize[0] * frame_len,) float32 CUDA
-    audio_prev_listen: torch.Tensor       # parallel to speech
-    audio_features: torch.Tensor          # (1, past_size, 2 * 1024) float32 CUDA -- speech || listen HuBERT history
-    past_cond: torch.Tensor               # (1, past_size, nfeats) float32 CUDA, normalised motion
-    noise_shared: torch.Tensor | None     # (1, 1, nfeats) CUDA AR(1) carry, or None on cold start
+    audio_prev_speech: torch.Tensor  # (chunksize[0] * frame_len,) float32 CUDA
+    audio_prev_listen: torch.Tensor  # parallel to speech
+    audio_features: (
+        torch.Tensor
+    )  # (1, past_size, 2 * 1024) float32 CUDA -- speech || listen HuBERT history
+    past_cond: torch.Tensor  # (1, past_size, nfeats) float32 CUDA, normalised motion
+    noise_shared: torch.Tensor | None  # (1, 1, nfeats) CUDA AR(1) carry, or None on cold start
+    stabilizer: MotionStabilizerState | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -230,14 +273,14 @@ class Normalizer:
     intro library.
     """
 
-    offset_so3: torch.Tensor       # (3,)
-    scale_so3: torch.Tensor        # (3,)
-    offset_kp: torch.Tensor        # (21, 3)
-    scale_kp: torch.Tensor         # (21, 3)
-    offset_exp: torch.Tensor       # (21, 3)
-    scale_exp: torch.Tensor        # (21, 3)
-    exp_lipsync_offset: torch.Tensor   # (N_LIPSYNC,) -- pre-sliced for de-norm
-    exp_lipsync_scale: torch.Tensor    # (N_LIPSYNC,)
+    offset_so3: torch.Tensor  # (3,)
+    scale_so3: torch.Tensor  # (3,)
+    offset_kp: torch.Tensor  # (21, 3)
+    scale_kp: torch.Tensor  # (21, 3)
+    offset_exp: torch.Tensor  # (21, 3)
+    scale_exp: torch.Tensor  # (21, 3)
+    exp_lipsync_offset: torch.Tensor  # (N_LIPSYNC,) -- pre-sliced for de-norm
+    exp_lipsync_scale: torch.Tensor  # (N_LIPSYNC,)
 
     @classmethod
     def from_safetensors(
@@ -323,9 +366,7 @@ class AVTR1MotionGenerator:
         # ``past_times`` is constant at inference: every past chunk is
         # marked "clean" (timestep = 1.0).
         n_past_chunks = past_size // chunk_size
-        self._past_times = torch.ones(
-            (1, n_past_chunks, 1), dtype=torch.float32, device="cuda"
-        )
+        self._past_times = torch.ones((1, n_past_chunks, 1), dtype=torch.float32, device="cuda")
         # HuBERT chunksize convention: (past, current, future) motion frames.
         self._hubert_chunksize: tuple[int, int, int] = (
             self.HUBERT_PAST_FRAMES,
@@ -336,7 +377,6 @@ class AVTR1MotionGenerator:
         # past portion -- those features were already collected on a prior
         # call and live in ``State.audio_features``.
         self._hubert_n_motion = chunk_size + future_size
-
 
     # -- State ---------------------------------------------------------------
 
@@ -366,6 +406,7 @@ class AVTR1MotionGenerator:
             ),
             past_cond=past_cond.contiguous(),
             noise_shared=None,
+            stabilizer=None,
         )
 
     # -- Per-chunk -----------------------------------------------------------
@@ -416,7 +457,9 @@ class AVTR1MotionGenerator:
 
         # ---- Build full audio_cond by prepending the 75-frame history ---
         history = state.audio_features  # already on CUDA
-        audio_cond = torch.cat([history, new_audio_feats], dim=1)  # (1, past+chunk+fut, 2*AUDIO_DIM)
+        audio_cond = torch.cat(
+            [history, new_audio_feats], dim=1
+        )  # (1, past+chunk+fut, 2*AUDIO_DIM)
 
         # ---- kp_cond ----------------------------------------------------
         kp_cond = self._build_kp_cond(avatar)
@@ -471,9 +514,7 @@ class AVTR1MotionGenerator:
         w_other = torch.full(
             (self.latent_dim,), options.cfg_other_audio, device=device, dtype=torch.float32
         )
-        w_kp = torch.full(
-            (self.latent_dim,), options.cfg_kp, device=device, dtype=torch.float32
-        )
+        w_kp = torch.full((self.latent_dim,), options.cfg_kp, device=device, dtype=torch.float32)
         # Pre-build the full ``t`` schedule on GPU as one contiguous
         # tensor (n_ode_steps, 1, 1); slice ``times[i]`` per step to get
         # a (1, 1) view -- no D2H. Linspace is uniform so ``dt`` is a
@@ -481,9 +522,9 @@ class AVTR1MotionGenerator:
         # did ``t_buf.fill_(float(time[i]))`` and
         # ``(time[i + 1] - time[i]).item()`` -- both CUDA->host syncs
         # inside the hot loop, ~9 syncs per chunk at n_ode_steps=10.
-        times = torch.linspace(
-            0.0, 1.0, self.n_ode_steps, device=device, dtype=torch.float32
-        ).view(-1, 1, 1)
+        times = torch.linspace(0.0, 1.0, self.n_ode_steps, device=device, dtype=torch.float32).view(
+            -1, 1, 1
+        )
         dt = 1.0 / (self.n_ode_steps - 1)
         for i in range(self.n_ode_steps - 1):
             self._decode(
@@ -502,9 +543,25 @@ class AVTR1MotionGenerator:
                 out=v_out,
             )
             x.add_(v_buf, alpha=dt)
-        # ``x`` is the normalised motion prediction for this chunk.
-        motions = self._motion_to_frames(x)
-        record_motion_prediction(x, past_cond[:, -1], motions)
+        # ``x`` remains the model-native prediction stored in autoregressive
+        # history. Stabilization corrects only the copy sent to the renderer,
+        # avoiding a distribution shift in future model calls.
+        raw_motions = self._motion_to_frames(x)
+        record_motion_prediction(x, past_cond[:, -1], raw_motions)
+        if options.stabilization.mode == "none":
+            motions = raw_motions
+            next_stabilizer = None
+        else:
+            stabilization = stabilize_normalized_motion(
+                x,
+                so3_offset=self._normalizer.offset_so3,
+                so3_scale=self._normalizer.scale_so3,
+                options=options.stabilization,
+                state=state.stabilizer,
+            )
+            record_motion_stabilization(options.stabilization, stabilization)
+            motions = self._motion_to_frames(stabilization.normalized)
+            next_stabilizer = stabilization.state
 
         # ---- next state -------------------------------------------------
         # past_cond: append this chunk's normalised motion, drop oldest.
@@ -521,8 +578,25 @@ class AVTR1MotionGenerator:
             audio_features=new_audio_features.contiguous(),
             past_cond=new_past_cond.contiguous(),
             noise_shared=next_noise_shared,
+            stabilizer=next_stabilizer,
         )
         return motions, next_state
+
+    # -- Offline analysis ---------------------------------------------------
+
+    def reference_normalized_motion(self, avatar: Avatar) -> torch.Tensor:
+        """Return one neutral normalized frame for sensitivity analysis."""
+        return self.initial_state(avatar).past_cond[:, -1:].clone()
+
+    def motion_from_normalized(self, normalized: torch.Tensor) -> MotionFrame:
+        """De-normalize diagnostic motion through the production conversion."""
+        if normalized.ndim != 3 or normalized.shape[0] != 1:
+            raise ValueError(
+                f"normalized motion must have shape (1, T, nfeats), got {tuple(normalized.shape)}"
+            )
+        if normalized.shape[-1] != self.nfeats:
+            raise ValueError(f"expected {self.nfeats} motion features, got {normalized.shape[-1]}")
+        return self._motion_to_frames(normalized)
 
     # -- Internal -----------------------------------------------------------
 
@@ -539,9 +613,9 @@ class AVTR1MotionGenerator:
         exp_n = (exp_in_R - self._normalizer.offset_exp) / self._normalizer.scale_exp
         exp_n = exp_n.clamp(-Z_SCORE_CLIP_VALUE, Z_SCORE_CLIP_VALUE)
 
-        return torch.cat(
-            [so3_n, kp_n.view(1, -1), exp_n.view(1, -1)], dim=-1
-        )[:, None]  # (1, 1, 129)
+        return torch.cat([so3_n, kp_n.view(1, -1), exp_n.view(1, -1)], dim=-1)[
+            :, None
+        ]  # (1, 1, 129)
 
     def _motion_to_frames(self, x: torch.Tensor) -> MotionFrame:
         """De-normalise the ODE result into a stacked ``MotionFrame``.
@@ -554,8 +628,7 @@ class AVTR1MotionGenerator:
 
         so3 = so3_n * self._normalizer.scale_so3 + self._normalizer.offset_so3  # (T, 3)
         exp_lipsync = (
-            exp_lipsync_n * self._normalizer.exp_lipsync_scale
-            + self._normalizer.exp_lipsync_offset
+            exp_lipsync_n * self._normalizer.exp_lipsync_scale + self._normalizer.exp_lipsync_offset
         )  # (T, N_LIPSYNC)
         R = roma.rotvec_to_rotmat(so3)  # (T, 3, 3)
         return MotionFrame(R=R, exp=exp_lipsync)
