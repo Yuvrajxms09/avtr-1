@@ -25,6 +25,7 @@ from avtr1_renderer.types import (
     FrameIterator,
     MotionStabilizationOptions,
     RenderOptions,
+    TemporalFilterMode,
 )
 
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "MotionStabilizationOptions",
     "Pipeline",
     "RenderOptions",
+    "TemporalFilterMode",
 ]

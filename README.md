@@ -211,6 +211,69 @@ Stabilization corrects only the motion copy sent to the renderer; the model's
 autoregressive history remains unchanged. Filter carry is serialized with the
 normal renderer state, so corrections remain continuous across API chunks.
 
+The spike guard, continuous One Euro filter, and acceleration/jerk limiter are
+independent layers. For example, this runs a conservative continuous rotation
+filter without the spike guard:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --motion-stabilization rotation \
+  --no-rotation-spike-guard \
+  --rotation-temporal-filter one_euro \
+  --rotation-one-euro-min-cutoff-hz 2.0 \
+  --rotation-one-euro-beta 0.1 \
+  --rotation-temporal-max-correction-deg 0.5 \
+  --rotation-max-acceleration-deg 0.35 \
+  --rotation-max-jerk-deg 0.5 \
+  --motion-debug-jsonl filtered-motion.jsonl \
+  --out filtered.mp4
+```
+
+Continuous expression filtering uses the same reviewed 39-coordinate profile
+as the expression spike guard. Zero-weight coordinates remain byte-for-byte
+unchanged. The One Euro filter raises its cutoff during fast motion, preserving
+more speech articulation than a fixed low-pass filter, and every correction is
+bounded by the configured per-frame maximum.
+
+### Temporal-filter sweep
+
+Run the predefined baseline, low-threshold spike, adaptive filter, kinematic
+limiter, and layered rotation configurations in one reproducible experiment:
+
+```bash
+pixi run sweep-rotation-stabilization \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --out rotation-sweep
+```
+
+The sweep writes each complete video separately, preserves each JSONL trace and
+console log, and creates `rotation_sweep_summary.csv` plus JSON configuration
+and metric manifests. Head step, acceleration, jerk, and chunk-boundary metrics
+are calculated over the complete frame timeline. Its selection score penalizes
+excessive correction and loss of expression activity; lower lipsync movement is
+not treated as an unconditional improvement. Pass a reviewed profile with at
+least one nonzero weight to append expression-only and combined runs:
+
+```bash
+pixi run sweep-rotation-stabilization \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --expression-profile expression-sensitivity/expression_profile.review.json \
+  --out combined-sweep
+```
+
+Motion diagnostics additionally include raw, spike-corrected and final motion;
+requested and applied corrections for every layer; per-keypoint XYZ tracks;
+per-keypoint temporal steps; and stitch correction by keypoint. Learned
+keypoints are deliberately logged by numeric ID rather than assigned
+unsupported anatomical labels.
+
 Available avatars are the filenames (without `.png`) inside
 `$AVTR1_LOCAL_STORAGE/v1/avatars_artifacts/reference_frames/` after downloading.
 

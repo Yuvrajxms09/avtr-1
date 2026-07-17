@@ -68,6 +68,9 @@ from avtr1_renderer.components.hubert import run_hubert
 from avtr1_renderer.components.liveportrait.motion_stitch import MotionFrame
 from avtr1_renderer.constants import LIPSYNC_COORDS
 from avtr1_renderer.diagnostics import (
+    enabled as motion_diagnostics_enabled,
+)
+from avtr1_renderer.diagnostics import (
     record_audio_chunk,
     record_motion_prediction,
     record_motion_stabilization,
@@ -122,12 +125,18 @@ def state_to_safetensors(state: AVTR1State) -> bytes:
         for name in (
             "rotation_position",
             "rotation_velocity",
+            "rotation_acceleration",
             "rotation_raw_position",
             "rotation_raw_velocity",
+            "rotation_filter_input",
+            "rotation_filter_derivative",
             "expression_position",
             "expression_velocity",
+            "expression_acceleration",
             "expression_raw_position",
             "expression_raw_velocity",
+            "expression_filter_input",
+            "expression_filter_derivative",
         ):
             value = getattr(stabilizer, name)
             if value is not None:
@@ -148,12 +157,18 @@ def state_from_safetensors(blob: bytes, *, device: str | torch.device = "cuda") 
             mode_code=int(moved["stabilizer_mode_code"].item()),
             rotation_position=moved.get("stabilizer_rotation_position"),
             rotation_velocity=moved.get("stabilizer_rotation_velocity"),
+            rotation_acceleration=moved.get("stabilizer_rotation_acceleration"),
             rotation_raw_position=moved.get("stabilizer_rotation_raw_position"),
             rotation_raw_velocity=moved.get("stabilizer_rotation_raw_velocity"),
+            rotation_filter_input=moved.get("stabilizer_rotation_filter_input"),
+            rotation_filter_derivative=moved.get("stabilizer_rotation_filter_derivative"),
             expression_position=moved.get("stabilizer_expression_position"),
             expression_velocity=moved.get("stabilizer_expression_velocity"),
+            expression_acceleration=moved.get("stabilizer_expression_acceleration"),
             expression_raw_position=moved.get("stabilizer_expression_raw_position"),
             expression_raw_velocity=moved.get("stabilizer_expression_raw_velocity"),
+            expression_filter_input=moved.get("stabilizer_expression_filter_input"),
+            expression_filter_derivative=moved.get("stabilizer_expression_filter_derivative"),
         )
     return AVTR1State(
         audio_prev_speech=moved["audio_prev_speech"],
@@ -552,6 +567,12 @@ class AVTR1MotionGenerator:
             motions = raw_motions
             next_stabilizer = None
         else:
+            timing_start = None
+            timing_end = None
+            if motion_diagnostics_enabled():
+                timing_start = torch.cuda.Event(enable_timing=True)
+                timing_end = torch.cuda.Event(enable_timing=True)
+                timing_start.record()
             stabilization = stabilize_normalized_motion(
                 x,
                 so3_offset=self._normalizer.offset_so3,
@@ -559,7 +580,16 @@ class AVTR1MotionGenerator:
                 options=options.stabilization,
                 state=state.stabilizer,
             )
-            record_motion_stabilization(options.stabilization, stabilization)
+            elapsed_ms = None
+            if timing_start is not None and timing_end is not None:
+                timing_end.record()
+                timing_end.synchronize()
+                elapsed_ms = timing_start.elapsed_time(timing_end)
+            record_motion_stabilization(
+                options.stabilization,
+                stabilization,
+                elapsed_ms=elapsed_ms,
+            )
             motions = self._motion_to_frames(stabilization.normalized)
             next_stabilizer = stabilization.state
 

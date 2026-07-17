@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
+import roma
 import torch
 
 from avtr1_renderer.constants import LIPSYNC_COORDS
@@ -93,16 +94,48 @@ def record_options(options: RenderOptions) -> None:
             "stream_frames": options.stream_frames,
             "motion_stabilization": {
                 "mode": options.stabilization.mode,
+                "rotation_spike_guard": options.stabilization.rotation_spike_guard,
                 "rotation_acceleration_threshold_deg": (
                     options.stabilization.rotation_acceleration_threshold_deg
                 ),
                 "rotation_max_correction_deg": (options.stabilization.rotation_max_correction_deg),
                 "rotation_strength": options.stabilization.rotation_strength,
+                "rotation_temporal_filter": options.stabilization.rotation_temporal_filter,
+                "rotation_one_euro_min_cutoff_hz": (
+                    options.stabilization.rotation_one_euro_min_cutoff_hz
+                ),
+                "rotation_one_euro_beta": options.stabilization.rotation_one_euro_beta,
+                "rotation_one_euro_derivative_cutoff_hz": (
+                    options.stabilization.rotation_one_euro_derivative_cutoff_hz
+                ),
+                "rotation_temporal_max_correction_deg": (
+                    options.stabilization.rotation_temporal_max_correction_deg
+                ),
+                "rotation_max_acceleration_deg": (
+                    options.stabilization.rotation_max_acceleration_deg
+                ),
+                "rotation_max_jerk_deg": options.stabilization.rotation_max_jerk_deg,
+                "expression_spike_guard": options.stabilization.expression_spike_guard,
                 "expression_acceleration_threshold_z": (
                     options.stabilization.expression_acceleration_threshold_z
                 ),
                 "expression_max_correction_z": (options.stabilization.expression_max_correction_z),
                 "expression_strength": options.stabilization.expression_strength,
+                "expression_temporal_filter": options.stabilization.expression_temporal_filter,
+                "expression_one_euro_min_cutoff_hz": (
+                    options.stabilization.expression_one_euro_min_cutoff_hz
+                ),
+                "expression_one_euro_beta": options.stabilization.expression_one_euro_beta,
+                "expression_one_euro_derivative_cutoff_hz": (
+                    options.stabilization.expression_one_euro_derivative_cutoff_hz
+                ),
+                "expression_temporal_max_correction_z": (
+                    options.stabilization.expression_temporal_max_correction_z
+                ),
+                "expression_max_acceleration_z": (
+                    options.stabilization.expression_max_acceleration_z
+                ),
+                "expression_max_jerk_z": options.stabilization.expression_max_jerk_z,
                 "expression_active_coordinates": (
                     None
                     if options.stabilization.expression_coordinate_weights is None
@@ -216,6 +249,8 @@ def record_motion_prediction(
             ).item(),
             "head_rotation_angle_deg": _series(_rotation_angle_degrees(motions.R)),
             "head_rotation_step_deg": _series(_rotation_step_degrees(motions.R)),
+            "head_rotvec_rad": roma.rotmat_to_rotvec(motions.R).detach().float().tolist(),
+            "expression_normalized": expression.detach().float().tolist(),
             "expression_abs": _summary(motions.exp.abs()),
             "expression_frame_normalized_l2": _series(expression_magnitude),
             "expression_step_normalized_l2": _series(expression_steps),
@@ -232,12 +267,20 @@ def _row_norms(values: torch.Tensor) -> torch.Tensor:
 def record_motion_stabilization(
     options: MotionStabilizationOptions,
     result: MotionStabilizationResult,
+    *,
+    elapsed_ms: float | None = None,
 ) -> None:
     if not enabled():
         return
 
     radians_to_degrees = 180.0 / math.pi
     rotation_correction_deg = _row_norms(result.rotation_correction) * radians_to_degrees
+    rotation_spike_correction_deg = (
+        _row_norms(result.rotation_spike_correction) * radians_to_degrees
+    )
+    rotation_temporal_correction_deg = (
+        _row_norms(result.rotation_temporal_correction) * radians_to_degrees
+    )
     expression_abs_correction = result.expression_correction.abs()
     expression_coordinate_max = (
         expression_abs_correction.amax(dim=0)
@@ -246,16 +289,28 @@ def record_motion_stabilization(
     )
     expression_interventions = expression_coordinate_max > 1e-6
     rotation_intervention_mask = rotation_correction_deg > 1e-6
+    rotation_spike_intervention_mask = rotation_spike_correction_deg > 1e-6
+    rotation_temporal_intervention_mask = rotation_temporal_correction_deg > 1e-6
     expression_intervention_mask = expression_abs_correction > 1e-6
     expression_frame_interventions = expression_intervention_mask.any(dim=-1)
+    expression_correction_ratio = (
+        _row_norms(result.expression_correction)
+        / _row_norms(result.raw_expression_velocity).clamp_min(1e-8)
+        if result.raw_expression_velocity.numel()
+        else result.raw_expression_velocity.new_empty(0)
+    )
 
     _emit(
         "motion_stabilization",
         {
             "mode": options.mode,
             "state_reset": result.state_reset,
+            "elapsed_ms": elapsed_ms,
             "rotation": {
                 "raw_rotvec_rad": result.raw_rotation.detach().float().tolist(),
+                "spike_corrected_rotvec_rad": (
+                    result.spike_corrected_rotation.detach().float().tolist()
+                ),
                 "corrected_rotvec_rad": result.corrected_rotation.detach().float().tolist(),
                 "raw_velocity_deg": _series(
                     _row_norms(result.raw_rotation_velocity) * radians_to_degrees
@@ -270,13 +325,28 @@ def record_motion_stabilization(
                     _row_norms(result.corrected_rotation_acceleration) * radians_to_degrees
                 ),
                 "correction_deg": _series(rotation_correction_deg),
+                "spike_correction_deg": _series(rotation_spike_correction_deg),
+                "lowpass_requested_correction_deg": _series(
+                    _row_norms(result.rotation_lowpass_requested_correction) * radians_to_degrees
+                ),
+                "kinematic_requested_correction_deg": _series(
+                    _row_norms(result.rotation_kinematic_requested_correction) * radians_to_degrees
+                ),
+                "temporal_correction_deg": _series(rotation_temporal_correction_deg),
                 "intervention_frames": int(rotation_intervention_mask.sum().item()),
+                "spike_intervention_frames": int(rotation_spike_intervention_mask.sum().item()),
+                "temporal_intervention_frames": int(
+                    rotation_temporal_intervention_mask.sum().item()
+                ),
                 "intervention_frame_indices": rotation_intervention_mask.nonzero(as_tuple=False)
                 .flatten()
                 .tolist(),
             },
             "expression": {
                 "raw_normalized": result.raw_expression.detach().float().tolist(),
+                "spike_corrected_normalized": (
+                    result.spike_corrected_expression.detach().float().tolist()
+                ),
                 "corrected_normalized": (result.corrected_expression.detach().float().tolist()),
                 "raw_velocity_l2": _series(_row_norms(result.raw_expression_velocity)),
                 "corrected_velocity_l2": _series(_row_norms(result.corrected_expression_velocity)),
@@ -285,7 +355,18 @@ def record_motion_stabilization(
                     _row_norms(result.corrected_expression_acceleration)
                 ),
                 "correction_l2": _series(_row_norms(result.expression_correction)),
+                "spike_correction_l2": _series(_row_norms(result.expression_spike_correction)),
+                "lowpass_requested_correction_l2": _series(
+                    _row_norms(result.expression_lowpass_requested_correction)
+                ),
+                "kinematic_requested_correction_l2": _series(
+                    _row_norms(result.expression_kinematic_requested_correction)
+                ),
+                "temporal_correction_l2": _series(
+                    _row_norms(result.expression_temporal_correction)
+                ),
                 "coordinate_max_abs_correction_z": _series(expression_coordinate_max),
+                "correction_to_raw_velocity_ratio": _series(expression_correction_ratio),
                 "intervention_frames": int(expression_frame_interventions.sum().item()),
                 "intervention_frame_indices": expression_frame_interventions.nonzero(as_tuple=False)
                 .flatten()
@@ -308,6 +389,7 @@ def _keypoint_geometry(keypoints: torch.Tensor) -> dict[str, Any]:
     extents = xy.amax(dim=1) - xy.amin(dim=1)
     radius = torch.linalg.vector_norm(xy - centers[:, None, :], dim=-1).mean(dim=1)
     center_steps = torch.linalg.vector_norm(centers[1:] - centers[:-1], dim=-1)
+    keypoint_steps = torch.linalg.vector_norm(keypoints[1:] - keypoints[:-1], dim=-1)
 
     mean_radius = radius.mean().clamp_min(1e-8)
     radius_range_pct = ((radius.max() - radius.min()) / mean_radius * 100.0).item()
@@ -317,6 +399,16 @@ def _keypoint_geometry(keypoints: torch.Tensor) -> dict[str, Any]:
         "radius": _series(radius),
         "radius_range_pct": radius_range_pct,
         "center_step_l2": _series(center_steps),
+        "coordinates_xyz": keypoints.detach().float().tolist(),
+        "per_keypoint_step_l2": {
+            "values": keypoint_steps.detach().float().transpose(0, 1).tolist(),
+            "p95": (
+                torch.quantile(keypoint_steps.float(), 0.95, dim=0).tolist()
+                if keypoint_steps.numel()
+                else []
+            ),
+            "max": (keypoint_steps.float().amax(dim=0).tolist() if keypoint_steps.numel() else []),
+        },
     }
 
 
@@ -329,7 +421,12 @@ def record_keypoint_geometry(
         return
 
     correction = torch.linalg.vector_norm(driving_stitched - driving_raw, dim=-1).mean(dim=1)
+    per_keypoint_correction = torch.linalg.vector_norm(
+        driving_stitched - driving_raw,
+        dim=-1,
+    )
     affected = _LIPSYNC_KEYPOINT_INDICES
+    source_locked = [index for index in range(source.shape[1]) if index not in affected]
     _emit(
         "keypoint_geometry",
         {
@@ -337,9 +434,23 @@ def record_keypoint_geometry(
             "driving_raw": _keypoint_geometry(driving_raw),
             "driving_stitched": _keypoint_geometry(driving_stitched),
             "lipsync_keypoint_indices": affected,
+            "source_locked_keypoint_indices": source_locked,
             "driving_raw_lipsync_subset": _keypoint_geometry(driving_raw[:, affected]),
             "driving_stitched_lipsync_subset": _keypoint_geometry(driving_stitched[:, affected]),
+            "driving_raw_source_locked_subset": _keypoint_geometry(driving_raw[:, source_locked]),
+            "driving_stitched_source_locked_subset": _keypoint_geometry(
+                driving_stitched[:, source_locked]
+            ),
             "stitch_correction_mean_l2": _series(correction),
+            "stitch_correction_per_keypoint_l2": {
+                "values": per_keypoint_correction.detach().float().transpose(0, 1).tolist(),
+                "p95": torch.quantile(
+                    per_keypoint_correction.float(),
+                    0.95,
+                    dim=0,
+                ).tolist(),
+                "max": per_keypoint_correction.float().amax(dim=0).tolist(),
+            },
         },
     )
 

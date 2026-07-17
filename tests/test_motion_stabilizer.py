@@ -147,9 +147,149 @@ def test_state_carries_across_chunks_and_resets_on_mode_change() -> None:
     assert changed_mode.state_reset
 
 
+def test_enabling_continuous_filter_resets_spike_only_carry() -> None:
+    spike_only = _apply(
+        _motion([0.0, 0.2]),
+        MotionStabilizationOptions(mode="rotation"),
+    )
+    filtered = _apply(
+        _motion([0.3, 0.4]),
+        MotionStabilizationOptions(
+            mode="rotation",
+            rotation_temporal_filter="one_euro",
+        ),
+        spike_only.state,
+    )
+
+    assert filtered.state_reset
+
+
+def test_one_euro_rotation_filter_is_bounded_and_reduces_oscillation() -> None:
+    motion = _motion([0.0, 0.5, -0.5, 0.5, -0.5])
+    result = _apply(
+        motion,
+        MotionStabilizationOptions(
+            mode="rotation",
+            rotation_spike_guard=False,
+            rotation_temporal_filter="one_euro",
+            rotation_one_euro_min_cutoff_hz=2.0,
+            rotation_one_euro_beta=0.1,
+            rotation_temporal_max_correction_deg=0.5,
+        ),
+    )
+
+    raw_step = torch.diff(result.raw_rotation[:, 0]).abs().mean()
+    corrected_step = torch.diff(result.corrected_rotation[:, 0]).abs().mean()
+    correction_deg = torch.rad2deg(
+        torch.linalg.vector_norm(result.rotation_temporal_correction, dim=-1)
+    )
+    assert corrected_step < raw_step
+    assert correction_deg.max() <= 0.5 + 1e-5
+    assert torch.count_nonzero(result.rotation_spike_correction).item() == 0
+
+
+def test_rotation_acceleration_limiter_bounds_output_acceleration() -> None:
+    result = _apply(
+        _motion([0.0, 0.0, 1.0, 1.0, 1.0]),
+        MotionStabilizationOptions(
+            mode="rotation",
+            rotation_spike_guard=False,
+            rotation_temporal_max_correction_deg=2.0,
+            rotation_max_acceleration_deg=0.1,
+        ),
+    )
+
+    acceleration_deg = torch.rad2deg(
+        torch.linalg.vector_norm(result.corrected_rotation_acceleration, dim=-1)
+    )
+    assert acceleration_deg.max() <= 0.1 + 1e-5
+
+
+def test_rotation_jerk_limiter_bounds_output_jerk() -> None:
+    result = _apply(
+        _motion([0.0, 0.0, 0.2, 1.0, -0.5, 0.5]),
+        MotionStabilizationOptions(
+            mode="rotation",
+            rotation_spike_guard=False,
+            rotation_temporal_max_correction_deg=3.0,
+            rotation_max_jerk_deg=0.1,
+        ),
+    )
+
+    jerk_deg = torch.rad2deg(
+        torch.linalg.vector_norm(torch.diff(result.corrected_rotation_acceleration, dim=0), dim=-1)
+    )
+    assert jerk_deg.max() <= 0.1 + 1e-5
+
+
+def test_one_euro_filter_is_continuous_across_chunks() -> None:
+    options = MotionStabilizationOptions(
+        mode="rotation",
+        rotation_spike_guard=False,
+        rotation_temporal_filter="one_euro",
+        rotation_temporal_max_correction_deg=2.0,
+    )
+    whole = _apply(_motion([0.0, 0.3, -0.2, 0.6, 0.1]), options)
+    first = _apply(_motion([0.0, 0.3]), options)
+    second = _apply(_motion([-0.2, 0.6, 0.1]), options, first.state)
+
+    torch.testing.assert_close(
+        torch.cat([first.corrected_rotation, second.corrected_rotation]),
+        whole.corrected_rotation,
+    )
+
+
+def test_continuous_expression_filter_only_changes_weighted_coordinates() -> None:
+    weights = [0.0] * EXPRESSION_COORDINATES
+    weights[7] = 0.5
+    motion = _motion([0.0] * 5)
+    values = torch.tensor([0.0, 1.0, -1.0, 1.0, -1.0])
+    motion[0, :, 3 + 7] = values
+    motion[0, :, 3 + 8] = values
+
+    result = _apply(
+        motion,
+        MotionStabilizationOptions(
+            mode="expression",
+            expression_spike_guard=False,
+            expression_temporal_filter="one_euro",
+            expression_coordinate_weights=tuple(weights),
+            expression_temporal_max_correction_z=0.25,
+        ),
+    )
+
+    assert torch.count_nonzero(result.expression_temporal_correction[:, 7]).item() > 0
+    assert result.expression_temporal_correction[:, 7].abs().max() <= 0.25
+    torch.testing.assert_close(
+        result.corrected_expression[:, 8],
+        result.raw_expression[:, 8],
+    )
+
+
 def test_expression_mode_requires_explicit_profile() -> None:
     with pytest.raises(ValueError, match="explicit coordinate profile"):
         _apply(
             _motion([0.0, 0.1]),
             MotionStabilizationOptions(mode="expression"),
+        )
+
+
+def test_temporal_filter_options_validate_bounds() -> None:
+    with pytest.raises(ValueError, match="rotation_one_euro_beta"):
+        _apply(
+            _motion([0.0, 0.1]),
+            MotionStabilizationOptions(
+                mode="rotation",
+                rotation_temporal_filter="one_euro",
+                rotation_one_euro_beta=-0.1,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="rotation_max_acceleration_deg"):
+        _apply(
+            _motion([0.0, 0.1]),
+            MotionStabilizationOptions(
+                mode="rotation",
+                rotation_max_acceleration_deg=-0.1,
+            ),
         )

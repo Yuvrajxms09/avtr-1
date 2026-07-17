@@ -276,7 +276,13 @@ def main() -> None:
         "--motion-stabilization",
         choices=("none", "rotation", "expression", "both"),
         default="none",
-        help="Experimental render-only motion spike guard (default: none).",
+        help="Experimental render-only temporal stabilization (default: none).",
+    )
+    parser.add_argument(
+        "--rotation-spike-guard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable isolated rotation-reversal suppression (default: on).",
     )
     parser.add_argument(
         "--rotation-acceleration-threshold-deg",
@@ -297,10 +303,38 @@ def main() -> None:
         help="Rotation correction blend in [0, 1].",
     )
     parser.add_argument(
+        "--rotation-temporal-filter",
+        choices=("none", "one_euro"),
+        default="none",
+        help="Continuous adaptive rotation filter (default: none).",
+    )
+    parser.add_argument("--rotation-one-euro-min-cutoff-hz", type=float, default=2.0)
+    parser.add_argument("--rotation-one-euro-beta", type=float, default=0.1)
+    parser.add_argument("--rotation-one-euro-derivative-cutoff-hz", type=float, default=1.0)
+    parser.add_argument("--rotation-temporal-max-correction-deg", type=float, default=0.5)
+    parser.add_argument(
+        "--rotation-max-acceleration-deg",
+        type=float,
+        default=0.0,
+        help="Per-frame angular acceleration limit; zero disables it.",
+    )
+    parser.add_argument(
+        "--rotation-max-jerk-deg",
+        type=float,
+        default=0.0,
+        help="Per-frame angular jerk limit; zero disables it.",
+    )
+    parser.add_argument(
         "--expression-profile",
         type=Path,
         default=None,
         help="Versioned JSON profile with 39 expression coordinate weights.",
+    )
+    parser.add_argument(
+        "--expression-spike-guard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable isolated expression-reversal suppression (default: on).",
     )
     parser.add_argument(
         "--expression-acceleration-threshold-z",
@@ -319,6 +353,28 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Expression correction blend in [0, 1].",
+    )
+    parser.add_argument(
+        "--expression-temporal-filter",
+        choices=("none", "one_euro"),
+        default="none",
+        help="Continuous coordinate-weighted expression filter (default: none).",
+    )
+    parser.add_argument("--expression-one-euro-min-cutoff-hz", type=float, default=3.0)
+    parser.add_argument("--expression-one-euro-beta", type=float, default=0.5)
+    parser.add_argument("--expression-one-euro-derivative-cutoff-hz", type=float, default=1.0)
+    parser.add_argument("--expression-temporal-max-correction-z", type=float, default=0.25)
+    parser.add_argument(
+        "--expression-max-acceleration-z",
+        type=float,
+        default=0.0,
+        help="Per-frame normalized acceleration limit; zero disables it.",
+    )
+    parser.add_argument(
+        "--expression-max-jerk-z",
+        type=float,
+        default=0.0,
+        help="Per-frame normalized jerk limit; zero disables it.",
     )
     args = parser.parse_args()
 
@@ -356,12 +412,28 @@ def main() -> None:
         parser.error("--expression-profile is required when expression stabilization is enabled")
     stabilization = MotionStabilizationOptions(
         mode=args.motion_stabilization,
+        rotation_spike_guard=args.rotation_spike_guard,
         rotation_acceleration_threshold_deg=args.rotation_acceleration_threshold_deg,
         rotation_max_correction_deg=args.rotation_max_correction_deg,
         rotation_strength=args.rotation_stabilization_strength,
+        rotation_temporal_filter=args.rotation_temporal_filter,
+        rotation_one_euro_min_cutoff_hz=args.rotation_one_euro_min_cutoff_hz,
+        rotation_one_euro_beta=args.rotation_one_euro_beta,
+        rotation_one_euro_derivative_cutoff_hz=(args.rotation_one_euro_derivative_cutoff_hz),
+        rotation_temporal_max_correction_deg=args.rotation_temporal_max_correction_deg,
+        rotation_max_acceleration_deg=args.rotation_max_acceleration_deg,
+        rotation_max_jerk_deg=args.rotation_max_jerk_deg,
+        expression_spike_guard=args.expression_spike_guard,
         expression_acceleration_threshold_z=args.expression_acceleration_threshold_z,
         expression_max_correction_z=args.expression_max_correction_z,
         expression_strength=args.expression_stabilization_strength,
+        expression_temporal_filter=args.expression_temporal_filter,
+        expression_one_euro_min_cutoff_hz=args.expression_one_euro_min_cutoff_hz,
+        expression_one_euro_beta=args.expression_one_euro_beta,
+        expression_one_euro_derivative_cutoff_hz=(args.expression_one_euro_derivative_cutoff_hz),
+        expression_temporal_max_correction_z=args.expression_temporal_max_correction_z,
+        expression_max_acceleration_z=args.expression_max_acceleration_z,
+        expression_max_jerk_z=args.expression_max_jerk_z,
         expression_coordinate_weights=expression_weights,
     )
     try:
@@ -490,8 +562,15 @@ def main() -> None:
     print(
         "Stabilization: "
         f"mode={args.motion_stabilization} "
+        f"rotation_spike={args.rotation_spike_guard} "
         f"rotation_threshold={args.rotation_acceleration_threshold_deg:g}deg "
         f"rotation_max={args.rotation_max_correction_deg:g}deg "
+        f"rotation_filter={args.rotation_temporal_filter} "
+        f"rotation_cutoff={args.rotation_one_euro_min_cutoff_hz:g}Hz "
+        f"rotation_beta={args.rotation_one_euro_beta:g} "
+        f"rotation_accel_limit={args.rotation_max_acceleration_deg:g}deg "
+        f"rotation_jerk_limit={args.rotation_max_jerk_deg:g}deg "
+        f"expression_filter={args.expression_temporal_filter} "
         f"expression_profile={args.expression_profile or 'none'}"
     )
     state = None

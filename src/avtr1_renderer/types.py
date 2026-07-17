@@ -111,27 +111,46 @@ class Frame:
 FrameIterator = Iterator[Frame]
 
 MotionStabilizationMode = Literal["none", "rotation", "expression", "both"]
+TemporalFilterMode = Literal["none", "one_euro"]
 
 
 @dataclass(slots=True, frozen=True)
 class MotionStabilizationOptions:
-    """Experimental temporal guards applied to normalized motion output.
+    """Experimental temporal filtering applied to normalized motion output.
 
-    The guards suppress isolated acceleration spikes; they are not general
-    low-pass filters. Disabled defaults are deliberately output-preserving.
-    Expression filtering operates in the model's z-score-normalized space so
-    one threshold has comparable meaning across all 39 coordinates.
+    Each enabled channel can run three independent render-only layers:
+    isolated spike suppression, an adaptive One Euro low-pass filter, and
+    bounded acceleration/jerk. Disabled defaults are deliberately
+    output-preserving. Expression filtering operates in the model's
+    z-score-normalized space and is blended by an explicit 39-coordinate
+    profile so unreviewed mouth motion is never changed implicitly.
     """
 
     mode: MotionStabilizationMode = "none"
 
+    rotation_spike_guard: bool = True
     rotation_acceleration_threshold_deg: float = 0.75
     rotation_max_correction_deg: float = 1.5
     rotation_strength: float = 1.0
+    rotation_temporal_filter: TemporalFilterMode = "none"
+    rotation_one_euro_min_cutoff_hz: float = 2.0
+    rotation_one_euro_beta: float = 0.1
+    rotation_one_euro_derivative_cutoff_hz: float = 1.0
+    rotation_temporal_max_correction_deg: float = 0.5
+    rotation_max_acceleration_deg: float = 0.0
+    rotation_max_jerk_deg: float = 0.0
 
+    expression_spike_guard: bool = True
     expression_acceleration_threshold_z: float = 1.5
     expression_max_correction_z: float = 2.0
     expression_strength: float = 1.0
+    expression_temporal_filter: TemporalFilterMode = "none"
+    expression_one_euro_min_cutoff_hz: float = 3.0
+    expression_one_euro_beta: float = 0.5
+    expression_one_euro_derivative_cutoff_hz: float = 1.0
+    expression_temporal_max_correction_z: float = 0.25
+    expression_max_acceleration_z: float = 0.0
+    expression_max_jerk_z: float = 0.0
     expression_coordinate_weights: tuple[float, ...] | None = None
 
     @property
@@ -142,14 +161,40 @@ class MotionStabilizationOptions:
     def expression_enabled(self) -> bool:
         return self.mode in {"expression", "both"}
 
+    @property
+    def rotation_kinematic_limiter_enabled(self) -> bool:
+        return self.rotation_max_acceleration_deg > 0 or self.rotation_max_jerk_deg > 0
+
+    @property
+    def expression_kinematic_limiter_enabled(self) -> bool:
+        return self.expression_max_acceleration_z > 0 or self.expression_max_jerk_z > 0
+
     def validate(self, *, expression_coordinates: int) -> None:
         if self.mode not in {"none", "rotation", "expression", "both"}:
             raise ValueError(f"Unknown motion stabilization mode: {self.mode!r}")
+        for name, value in (
+            ("rotation_temporal_filter", self.rotation_temporal_filter),
+            ("expression_temporal_filter", self.expression_temporal_filter),
+        ):
+            if value not in {"none", "one_euro"}:
+                raise ValueError(f"Unknown {name}: {value!r}")
         for name, value in (
             ("rotation_acceleration_threshold_deg", self.rotation_acceleration_threshold_deg),
             ("rotation_max_correction_deg", self.rotation_max_correction_deg),
             ("expression_acceleration_threshold_z", self.expression_acceleration_threshold_z),
             ("expression_max_correction_z", self.expression_max_correction_z),
+            ("rotation_one_euro_min_cutoff_hz", self.rotation_one_euro_min_cutoff_hz),
+            (
+                "rotation_one_euro_derivative_cutoff_hz",
+                self.rotation_one_euro_derivative_cutoff_hz,
+            ),
+            ("rotation_temporal_max_correction_deg", self.rotation_temporal_max_correction_deg),
+            ("expression_one_euro_min_cutoff_hz", self.expression_one_euro_min_cutoff_hz),
+            (
+                "expression_one_euro_derivative_cutoff_hz",
+                self.expression_one_euro_derivative_cutoff_hz,
+            ),
+            ("expression_temporal_max_correction_z", self.expression_temporal_max_correction_z),
         ):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be greater than zero, got {value}")
@@ -159,6 +204,16 @@ class MotionStabilizationOptions:
         ):
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {value}")
+        for name, value in (
+            ("rotation_one_euro_beta", self.rotation_one_euro_beta),
+            ("expression_one_euro_beta", self.expression_one_euro_beta),
+            ("rotation_max_acceleration_deg", self.rotation_max_acceleration_deg),
+            ("rotation_max_jerk_deg", self.rotation_max_jerk_deg),
+            ("expression_max_acceleration_z", self.expression_max_acceleration_z),
+            ("expression_max_jerk_z", self.expression_max_jerk_z),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
 
         weights = self.expression_coordinate_weights
         if self.expression_enabled and weights is None:
@@ -236,4 +291,5 @@ __all__ = [
     "MotionStabilizationMode",
     "MotionStabilizationOptions",
     "RenderOptions",
+    "TemporalFilterMode",
 ]
