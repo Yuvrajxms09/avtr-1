@@ -142,11 +142,11 @@ def _filter_vectors(
 def _similarity_to_reference(
     reference: torch.Tensor,
     current: torch.Tensor,
-    indices: tuple[int, ...],
+    indices: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return current aligned to reference plus the forward transform."""
-    ref = reference[indices]
-    cur = current[indices]
+    ref = reference.index_select(0, indices)
+    cur = current.index_select(0, indices)
     ref_center = ref.mean(dim=0)
     cur_center = cur.mean(dim=0)
     ref_zero = ref - ref_center
@@ -191,6 +191,7 @@ def stabilize_keypoints(
     indices = options.post_stitch_keypoint_indices or source_locked_keypoint_indices(
         keypoint_count
     )
+    index_tensor = torch.tensor(indices, device=driving_raw.device, dtype=torch.long)
     protected = set(range(keypoint_count)) - set(source_locked_keypoint_indices(keypoint_count))
     unsafe = sorted(set(indices) & protected)
     if options.post_stitch_enabled and unsafe:
@@ -256,7 +257,7 @@ def stabilize_keypoints(
             aligned, scale, rotation, translation = _similarity_to_reference(
                 reference,
                 frame,
-                indices,
+                index_tensor,
             )
             aligned_frames.append(aligned)
             scales.append(scale)
@@ -264,7 +265,7 @@ def stabilize_keypoints(
             translations.append(translation)
         aligned_all = torch.stack(aligned_frames)
         residual_raw = aligned_all - reference
-        selected = residual_raw[:, indices]
+        selected = residual_raw.index_select(1, index_tensor)
         residual_filter = _filter_vectors(
             selected,
             previous_position=state.residual_position,
@@ -276,7 +277,7 @@ def stabilize_keypoints(
             max_correction=options.post_stitch_max_correction,
         )
         residual_corrected = residual_raw.clone()
-        residual_corrected[:, indices] = residual_filter.values
+        residual_corrected.index_copy_(1, index_tensor, residual_filter.values)
         restored: list[torch.Tensor] = []
         for frame_index, residual in enumerate(residual_corrected):
             restored.append(
@@ -292,7 +293,11 @@ def stabilize_keypoints(
         # The reviewed mask is a hard safety boundary.  Lipsync and all
         # unselected keypoints remain byte-for-byte equal to the stitch blend.
         masked_correction = torch.zeros_like(post_correction)
-        masked_correction[:, indices] = post_correction[:, indices]
+        masked_correction.index_copy_(
+            1,
+            index_tensor,
+            post_correction.index_select(1, index_tensor),
+        )
         post_correction = masked_correction
         final = blended - post_correction
 
