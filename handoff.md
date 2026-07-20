@@ -1,12 +1,14 @@
 # AVTR-1 Motion Stability Handoff
 
-Last updated: 2026-07-18
+Last updated: 2026-07-20
 Repository: `https://github.com/Yuvrajxms09/avtr-1`
 Branch: `main`
-Current implementation commit: `429af51` (`Add layered temporal stabilization sweep`)
-Current working tree: deterministic replay, stage capture/analysis,
-post-stitch experiment controls, and turn-aware CFG guidance implemented but
-not yet built, tested, or validated on CUDA.
+Current implementation commit: `b53f2c7` (`Fix post-stitch keypoint indexing`)
+Current working tree: clean and pushed. Deterministic replay, geometry/pixel
+stage capture and analysis, stitch controls, post-stitch controls, and
+turn-aware CFG guidance have executed successfully on the real Colab
+CUDA/TensorRT path. The new unit/static test suite has still not been run in
+that environment.
 
 ## 1. Purpose of this document
 
@@ -35,6 +37,14 @@ The main distinction to preserve is:
 - The One Euro candidate materially reduces measured head jitter. It has not
   materially reduced face/lipsync-region size variation, so the facial
   morphing complaint remains unresolved.
+- Deterministic stage isolation now shows that the raw source-locked geometry
+  is effectively static and that the stitch network is the first stage that
+  introduces the measured source-locked non-rigid motion.
+- Reducing stitch strength improves geometry metrics causally on the identical
+  raw trajectory. Full stitch bypass (`stitch_strength=0`) produced the largest
+  numerical morphing reduction, but the resulting video was visually assessed
+  as not good and is rejected. Metric improvement is therefore not an accepted
+  morphing fix.
 
 Therefore there is no single globally proven production configuration yet.
 
@@ -67,10 +77,10 @@ Current state snapshot:
 | Rotation One Euro filter | Tested candidate | Moderate filtering reduced within-run head step `17.0%`, acceleration `44.5%`, jerk `41.9%`, and chunk-boundary movement `33.7%`. |
 | Rotation acceleration/jerk limiters | Tested and rejected at current settings | They reduced selected derivatives by increasing head step or boundary movement. |
 | Expression temporal filters and four-coordinate profile | Tested, not accepted | The filters changed the intended coordinates, but rendered face/lipsync improvements were too small and confounded by raw-run variation. |
-| Facial morphing fix | Not established | Rotation filtering barely changed face/lipsync size metrics; expression filtering did not produce a causal improvement. |
-| Deterministic replay and stage capture | Source-implemented, unverified | Raw motion capture/replay, fingerprint assertions, geometry/pixel stage artifacts, and rigid-aligned analysis are present but have not been executed. |
-| Stitch/post-stitch controls | Source-implemented, unverified | Stitch strength/filtering and a source-locked non-rigid prototype are default-disabled and require deterministic evidence before use. |
-| Turn-aware CFG switching | Source-implemented, unverified | Default-disabled chunk controller supports automatic RMS classification or explicit upstream state, hysteresis, interpolation, overlap/silence hold, diagnostics, and serialized carry. |
+| Facial morphing fix | Not established; runtime path near saturation | The defect was localized to stitch-induced geometry on one deterministic sample. Stitch bypass improved geometry metrics but failed visual review. Temporal stitch/post-stitch filters primarily reduced jitter and did not establish a visual morphing fix. |
+| Deterministic replay and stage capture | Executed on CUDA/TensorRT | Capture/replay, strict fingerprints, geometry/pixel artifacts, and the rigid-aligned analyzer completed across baseline and all tested branches with fingerprint `c83a1d3576d9e052a1400de9ca5eb7993bf9bef3a34286f7208dbdec0a61956a`. |
+| Stitch/post-stitch controls | Tested candidates, none accepted | Strengths `0.00`, `0.25`, `0.50`, `0.75`, and `1.00`, stitch One Euro, and source-locked post-stitch filtering were evaluated against one identical trajectory. Strength `0.00` was visually rejected; no candidate is production-approved. |
+| Turn-aware CFG switching | Partially runtime-validated | Automatic guidance completed on speech plus a silent listen track: 61 speaking and 15 silence chunks, one stable-state transition, and no runtime failure. Real listening, overlap, interruption, and serialized API-state validation remain open. |
 
 The head-jitter parameter/filter investigation is near saturation. Moderate
 rotation-only One Euro is the current head-stability candidate; more broad
@@ -80,13 +90,12 @@ is also near saturation as a morphing solution. It remains useful for diagnosis,
 but it did not materially reduce the visible defect and must not be repeated as
 another broad sweep.
 
-The immediate next task is to run and validate the new deterministic
-morphing-stage isolation path on CUDA. Generate one raw trajectory once, then
-replay it through baseline and candidate branches. Compare raw driving
-geometry, stitch-network geometry, final geometry, decoded face crops, and
-final composited frames in order. This removes the observed TensorRT/run-to-run
-motion differences and determines whether morphing first appears in model
-motion, stitch correction, warp/decoder output, or final compositing.
+The deterministic morphing-stage isolation task is complete for Maria and
+`demoday15.mp3`. Do not repeat the same broad candidate matrix. The next
+decision is whether to perform one final visual review of the already-generated
+`stitch_strength=0.50` compromise across more samples. If that does not produce
+an obvious visual gain without alignment/expression regressions, stop runtime
+morphing-filter work and scope stitch/renderer retraining or replacement.
 
 Non-negotiable instructions for the next agent:
 
@@ -114,7 +123,10 @@ Non-negotiable instructions for the next agent:
     stabilization targets.
 12. Do not optimize only whole-face or lipsync-subset radius. Those aggregates
     can improve while local shape, identity, or mouth articulation regresses.
-13. Do not use generic whole-frame smoothing as evidence of a local morphing
+13. Visual rejection overrides a passing geometry gate. Do not call
+    `stitch_strength=0` a morphing fix; its metric improvement did not survive
+    full-resolution visual review.
+14. Do not use generic whole-frame smoothing as evidence of a local morphing
     fix. Global stabilization and non-rigid facial stability are separate
     problems.
 
@@ -706,7 +718,7 @@ The current repository still does **not** contain:
 - A model-training fix or access to retraining losses/data.
 - Face-aware post-render stabilization or optical-flow restoration.
 
-The 2026-07-18 working tree now contains, but has not validated on CUDA:
+The repository now contains:
 
 - Fingerprinted raw normalized-motion capture/replay with strict metadata and
   complete-consumption checks.
@@ -718,11 +730,12 @@ The 2026-07-18 working tree now contains, but has not validated on CUDA:
 - Default-disabled turn-aware `cfg_other_audio` selection with RMS Schmitt
   thresholds, chunk hysteresis/interpolation, and serialized carry.
 
-The keypoint diagnostics and implementation needed to begin stage localization
-are present. The broad rotation/expression sweep is complete. The next task is
-CUDA validation of capture/replay integrity and baseline stage localization;
-expression correlation remains conditional on raw driving geometry being
-implicated.
+The capture/replay, geometry/pixel artifact, analyzer, stitch-strength,
+stitch-filter, post-stitch, and speech/silence turn-guidance paths completed on
+the real Colab CUDA/TensorRT environment on 2026-07-20. This validates the
+runtime plumbing on one avatar/audio sample; it does not validate production
+quality, multiple avatars, real listening/overlap, state serialization, or the
+new unit/static test suite.
 
 ## 11. Completed comprehensive temporal-stability experiment
 
@@ -1269,8 +1282,9 @@ single-coordinate A/B described above is the causal confirmation step.
 This is the active investigation for the manager-reported facial-region size
 changes. It supersedes broader expression-coordinate tuning as the primary
 morphing direction. The diagnostic capture/analyzer and bounded runtime
-controls below are implemented, but no morphing fix has been accepted or
-validated yet.
+controls below are implemented and have been executed on one deterministic
+CUDA/TensorRT sample. No morphing fix has been accepted; Section 13.6.8 records
+the completed evidence and visual rejection.
 
 #### 13.6.1 Pipeline and stage-localization order
 
@@ -1450,6 +1464,59 @@ Stop runtime morphing-filter work if the stitch-control experiment and one
 conservative post-stitch prototype both fail these gates. Record the runtime
 architecture as saturated for this defect and recommend renderer/model
 retraining or replacement rather than adding more filter combinations.
+
+#### 13.6.8 Completed deterministic stage experiment (2026-07-20)
+
+The protocol above was executed on commit `b53f2c7` with Maria,
+`demoday15.mp3`, seed `1234`, `self=2`, `other=1`, and the real auto-selected
+TensorRT path. All geometry branches replayed the same captured raw trajectory:
+
+```text
+c83a1d3576d9e052a1400de9ca5eb7993bf9bef3a34286f7208dbdec0a61956a
+```
+
+The baseline source-locked temporal-step p95 was approximately
+`4.95e-8` before stitching and `3.45e-4` after stitching. The first material
+measured amplification was therefore the stitch network. The very large
+percentage amplification reported by the analyzer must not be quoted as an
+effect size because the raw denominator is nearly zero; the stage ordering is
+the useful result.
+
+The first fixed candidate matrix produced:
+
+| Candidate | Source-locked step | Acceleration | Jerk | Boundary step | Lipsync step | Final pixel residual | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Post-stitch source-locked | `-49.13%` | `-64.94%` | `-69.34%` | `-55.65%` | `+0.01%` | `+0.83%` | Strong geometry smoothing, no accepted visual morphing fix. |
+| Stitch One Euro | `-49.09%` | `-64.91%` | `-69.42%` | `-57.73%` | `-0.29%` | `+1.13%` | Strong geometry smoothing, primarily a jitter result. |
+| Stitch strength `0.75` | `-26.25%` | `-28.17%` | `-27.58%` | `-29.88%` | `-0.20%` | `+0.25%` | Conservative attenuation; no established visual fix. |
+| Rotation One Euro | `+3.24%` | `-3.79%` | `-3.96%` | `-2.93%` | `-0.28%` | `-4.14%` | Does not address source-locked morphing geometry. |
+| Expression One Euro | `+5.63%` | `+0.16%` | `+0.39%` | `+0.14%` | `-4.34%` | `+0.36%` | Reject as a morphing direction. |
+
+A follow-up deterministic strength ablation used `0.00`, `0.25`, and `0.50`
+against the same baseline and fingerprint:
+
+| Strength | Source step | Non-rigid residual | Pairwise deformation | Shape range | Lipsync step | Final pixel residual | Status |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `0.00` | `-99.99%` | `-17.06%` | `-33.33%` | `-99.99%` | `-0.27%` | `-2.73%` | Largest numerical morphing reduction, but visually assessed as not good; rejected. |
+| `0.25` | `-74.52%` | `-15.90%` | `-28.80%` | `-76.40%` | `-0.24%` | `-2.07%` | Not visually reviewed or accepted. Do not infer quality from interpolation metrics. |
+| `0.50` | `-49.61%` | `-12.60%` | `-21.27%` | `-49.17%` | `-0.21%` | `-3.12%` | Best pixel metric and the only remaining bounded compromise worth visual review; not accepted. |
+
+The `stitch_strength=0` result is the central negative finding. It proves that
+stitch correction contributes causally to the measured deformation, but it
+also proves that removing the learned correction is not a production solution:
+the full-resolution video looked worse despite passing the geometry gates.
+Visual quality outranks the proxy metrics.
+
+The practical conclusion is:
+
+- Jitter-like source-locked geometry can be reduced with stitch or post-stitch
+  temporal controls.
+- No tested runtime candidate has fixed the manager-visible facial morphing.
+- The learned stitch correction is both part of the problem and necessary for
+  acceptable alignment/rendering quality, creating a weight-level tradeoff.
+- Do not add more broad filters. If strength `0.50` fails visual review across
+  representative samples, move to stitch/warp/decoder retraining, replacement,
+  or new weights with identity and non-mouth shape-consistency objectives.
 
 ## 14. Production solution direction
 
@@ -1670,10 +1737,24 @@ arbitrary custom portraits. The observed 5-frame processing time was roughly
 of video represented by a chunk. Diagnostic logging adds synchronization and
 must not be used to claim production throughput.
 
+Runtime lessons from the deterministic Colab run:
+
+- Do not force `--renderer-backend onnx` for this artifact set. The ONNX warp
+  graph uses `GridSample3D`, which the installed ONNX Runtime does not support.
+  Use the default `auto` path so the TensorRT renderer engines are selected.
+- Exact hashes of GPU-produced avatar registration floats were not stable
+  across processes. Commit `4c9953d` fingerprints the stable loaded portrait
+  tensor instead while retaining strict audio/config/trajectory checks.
+- A tuple of source-locked keypoint IDs was initially interpreted as
+  multi-axis PyTorch indexing. Commit `b53f2c7` uses explicit
+  `index_select`/`index_copy_`; post-stitch replay then completed successfully.
+- Failed captures and stage directories must not be reused as evidence. Start
+  a new run root or remove only the explicitly identified incomplete candidate
+  before retrying.
+
 ## 19. Current verification status
 
-Completed locally for the earlier stabilization implementation before the
-current uncommitted working-tree changes:
+Completed locally for the earlier stabilization implementation:
 
 - CPU behavior tests for disabled identity behavior.
 - Isolated spike suppression.
@@ -1687,15 +1768,13 @@ current uncommitted working-tree changes:
 - Diagnostic JSON/per-keypoint smoke test.
 - Python compilation, formatting, linting, and whitespace checks.
 
-Still required in Colab:
+Still required:
 
 - Run the newly added unit tests and static tooling for deterministic replay,
   stage artifacts/analysis, geometry stabilization, state carry, and turn
   guidance; none were executed while authoring the current source changes.
 - Runtime state serialization test with the actual environment.
 - Multi-avatar and multi-audio validation.
-- End-to-end validation of deterministic capture/replay fingerprints, stage
-  artifact integrity, and analyzer output on the real CUDA/TensorRT path.
 - External lip-sync and mouth-range validation.
 - Production API transition/interrupt/overlap testing.
 
@@ -1709,6 +1788,19 @@ Completed in Colab on the real TensorRT path:
   ablations.
 - Encoded-video optical-flow assessment for repository baseline, prior CFG
   optimum, and moderate One Euro candidate.
+- Deterministic raw-motion capture and replay across baseline plus rotation,
+  expression, stitch, post-stitch, and combined branches using one verified
+  fingerprint.
+- Hash-verified geometry and lossless decoded/final pixel stage artifacts, plus
+  the rigid-aligned morphing-stage analyzer.
+- Stitch strengths `0.00`, `0.25`, `0.50`, `0.75`, and `1.00` on the identical
+  trajectory.
+- Runtime post-stitch source-locked stabilization after correcting tuple-index
+  handling in commit `b53f2c7`.
+- Speech/silence automatic turn guidance on 76 chunks. Real listening and
+  overlap were not exercised because the listen track was silence.
+- Full-resolution visual review of stitch bypass (`strength=0.00`), which was
+  judged not good and rejected despite its numerical geometry improvements.
 
 ### Production acceptance checklist
 
@@ -1733,35 +1825,37 @@ A candidate should not be enabled globally until all of the following are true:
 
 ## 20. Recommended next decisions
 
-1. Run one CUDA raw-motion capture and verify its stored fingerprint and
-   metadata manifest.
-2. Replay the capture into a default baseline with geometry and lossless pixel
-   stage artifacts, then run the rigid-aligned analyzer.
-3. If stitching is implicated, run the implemented fixed
-   `0.00/0.25/0.50/0.75/1.00` stitch-strength A/B and one weak
-   stitch-correction filter against the identical fingerprint.
-4. If final keypoint geometry is implicated, validate the implemented bounded
-   post-stitch source-locked stabilizer with lipsync keypoints untouched.
-5. If stable keypoints still render unstable pixels, compare TensorRT FP16 with
-   a feasible higher-precision reference and separate decoded-face instability
-   from pasteback/matting instability.
-6. Validate any surviving candidate across at least three avatars, three
-   speaking audios, listening, and silence using the Section 13.6 acceptance
-   gates.
-7. If stitch control and the post-stitch prototype fail, stop runtime morphing
-   filter work and scope renderer/model retraining or replacement.
-8. In parallel, validate moderate and light rotation One Euro across multiple
-   captured trajectories and test listening, silence, interruption, and overlap.
-9. Validate the implemented turn-aware `cfg_other_audio` controller across
-   speaking, listening, interruption, overlap, silence, and serialized API
-   state; keep it disabled until filter behavior is stable at turn boundaries.
-10. Add a final global correction cap only if layered rotation filters are ever
-    reconsidered; the current pure One Euro candidate does not require layering.
+1. Do not repeat the completed Maria/`demoday15.mp3` deterministic candidate
+   matrix or another broad expression/filter sweep.
+2. Review the already-generated `stitch_strength=0.50` video only as a final
+   bounded compromise. If it does not show an obvious visual morphing gain
+   without alignment, expression, identity, or seam regressions, reject runtime
+   stitch attenuation as a production direction.
+3. If a runtime compromise survives visual review, validate it on at least
+   three avatars and three speaking audios before changing any defaults. Require
+   original-resolution review and external lip-sync/mouth-range evidence.
+4. Otherwise stop runtime morphing-filter work. Scope new stitch/warp/decoder
+   weights or retraining with temporal identity and non-mouth shape-consistency
+   objectives. The current evidence shows a learned-weight tradeoff, not a
+   missing temporal-filter combination.
+5. Keep rotation One Euro separate as a head-jitter candidate. Validate moderate
+   and light settings across multiple captured trajectories and intentional
+   head-turn samples; do not present it as a morphing fix.
+6. Validate turn-aware `cfg_other_audio` with a real listen track covering
+   listening, interruption, overlap, and silence, then verify serialized API
+   state across turn boundaries. Keep it disabled by default.
+7. Run the new unit tests, lint, type checks, and state-codec tests in the Linux
+   renderer environment. Runtime execution has succeeded, but the new automated
+   suite is still unexecuted.
+8. Preserve the current default renderer behavior and rollback path. No
+   geometry or turn-guidance candidate is production-approved.
 
 The current evidence supports a substantial measured reduction in global head
 jitter on one speaking sample, not completion. The moderate One Euro candidate
 is the strongest clean setting; the light preset is the conservative fallback.
-The face-morphing complaint remains open.
+The face-morphing complaint remains open. Stage localization implicates the
+stitch correction, but complete bypass was visually rejected and no runtime
+candidate has passed the visual production gate.
 
 ### Required handoff update after each experiment
 
