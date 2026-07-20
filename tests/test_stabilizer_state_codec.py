@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import torch
 
 from avtr1_renderer.avtr1_motion_generator import (
@@ -5,7 +7,9 @@ from avtr1_renderer.avtr1_motion_generator import (
     state_from_safetensors,
     state_to_safetensors,
 )
+from avtr1_renderer.keypoint_stabilizer import KeypointStabilizerState
 from avtr1_renderer.motion_stabilizer import MotionStabilizerState
+from avtr1_renderer.turn_guidance import TurnGuidanceState
 
 
 def _avtr_state(stabilizer: MotionStabilizerState | None) -> AVTR1State:
@@ -74,3 +78,52 @@ def test_state_codec_remains_compatible_when_stabilization_is_disabled() -> None
     )
 
     assert restored.stabilizer is None
+    assert restored.keypoint_stabilizer is None
+    assert restored.turn_guidance is None
+
+
+def test_state_codec_preserves_keypoint_stabilizer_carry() -> None:
+    keypoint = KeypointStabilizerState(
+        configuration_code=91,
+        stitch_position=torch.randn(21, 3),
+        stitch_filter_input=torch.randn(21, 3),
+        stitch_filter_derivative=torch.randn(21, 3),
+        residual_position=torch.randn(8, 3),
+        residual_filter_input=torch.randn(8, 3),
+        residual_filter_derivative=torch.randn(8, 3),
+    )
+    state = replace(_avtr_state(None), keypoint_stabilizer=keypoint)
+    restored = state_from_safetensors(state_to_safetensors(state), device="cpu")
+    assert restored.keypoint_stabilizer is not None
+    assert restored.keypoint_stabilizer.configuration_code == 91
+    for name in (
+        "stitch_position",
+        "stitch_filter_input",
+        "stitch_filter_derivative",
+        "residual_position",
+        "residual_filter_input",
+        "residual_filter_derivative",
+    ):
+        torch.testing.assert_close(
+            getattr(restored.keypoint_stabilizer, name),
+            getattr(keypoint, name),
+        )
+
+
+def test_state_codec_preserves_turn_guidance_carry() -> None:
+    guidance = TurnGuidanceState(
+        stable_state_code=1,
+        pending_state_code=2,
+        pending_chunks=1,
+        state_age_chunks=7,
+        effective_cfg_other_audio=1.25,
+    )
+    state = replace(_avtr_state(None), turn_guidance=guidance)
+    restored = state_from_safetensors(state_to_safetensors(state), device="cpu")
+
+    assert restored.turn_guidance is not None
+    assert restored.turn_guidance.stable_state_code == 1
+    assert restored.turn_guidance.pending_state_code == 2
+    assert restored.turn_guidance.pending_chunks == 1
+    assert restored.turn_guidance.state_age_chunks == 7
+    assert restored.turn_guidance.effective_cfg_other_audio == 1.25

@@ -16,10 +16,11 @@ encode + decode TRT engines.
 
 from __future__ import annotations
 
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, runtime_checkable
 
 from avtr1_renderer.avatar_loader import Avatar
 from avtr1_renderer.components.liveportrait.motion_stitch import MotionFrame
+from avtr1_renderer.keypoint_stabilizer import KeypointStabilizerState
 from avtr1_renderer.types import Chunk, RenderOptions
 
 StateT = TypeVar("StateT")
@@ -52,4 +53,18 @@ class MotionGenerator(Protocol[StateT]):
     ) -> tuple[MotionFrame, StateT]: ...
 
 
-__all__ = ["MotionGenerator"]
+
+@runtime_checkable
+class GeometryStatefulMotionGenerator(Protocol[StateT]):
+    """Optional carry adapter for post-stitch temporal experiments."""
+
+    def keypoint_stabilizer_state(self, state: StateT) -> KeypointStabilizerState | None: ...
+
+    def with_keypoint_stabilizer_state(
+        self,
+        state: StateT,
+        keypoint_stabilizer: KeypointStabilizerState | None,
+    ) -> StateT: ...
+
+
+__all__ = ["GeometryStatefulMotionGenerator", "MotionGenerator"]

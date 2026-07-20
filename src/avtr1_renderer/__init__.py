@@ -23,9 +23,12 @@ from avtr1_renderer.types import (
     Chunk,
     Frame,
     FrameIterator,
+    GeometryStabilizationOptions,
     MotionStabilizationOptions,
     RenderOptions,
     TemporalFilterMode,
+    TurnAwareGuidanceOptions,
+    TurnGuidanceMode,
 )
 
 __all__ = [
@@ -33,8 +36,11 @@ __all__ = [
     "Chunk",
     "Frame",
     "FrameIterator",
+    "GeometryStabilizationOptions",
     "MotionStabilizationOptions",
     "Pipeline",
     "RenderOptions",
     "TemporalFilterMode",
+    "TurnAwareGuidanceOptions",
+    "TurnGuidanceMode",
 ]

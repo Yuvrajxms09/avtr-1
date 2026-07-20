@@ -15,8 +15,7 @@ warp -- decoder, pasteback, matting, bg composite -- runs per frame
 in :func:`render_chunk_streaming` so the pipeline can yield each
 finished frame before the next one starts.
 
-``motion_stitch`` still iterates the b=1 stitch engine internally
-since its compute is small.
+The batch-dynamic stitch engine runs once for the complete chunk.
 
 Pixel-format conversion + H2D copy live in :func:`pack_frames` so the
 renderer can be paired with arbitrary output formats without touching
@@ -32,7 +31,8 @@ import torch
 from avtr1_renderer.avatar_loader import Avatar
 from avtr1_renderer.components.liveportrait.motion_stitch import (
     MotionFrame,
-    motion_stitch,
+    PreparedKeypoints,
+    prepare_keypoints,
 )
 from avtr1_renderer.components.putback import putback_chunk
 from avtr1_renderer.diagnostics import (
@@ -44,6 +44,7 @@ from avtr1_renderer.models.decoder import DecoderEngine, DecoderInput, DecoderOu
 from avtr1_renderer.models.matting import MODNetEngine
 from avtr1_renderer.models.stitch import StitchEngine
 from avtr1_renderer.models.warp import WarpEngine, WarpInput
+from avtr1_renderer.stage_artifacts import record_pixel_stage
 
 
 def render_chunk_streaming(
@@ -55,6 +56,7 @@ def render_chunk_streaming(
     warp: WarpEngine,
     decoder: DecoderEngine,
     matting: MODNetEngine,
+    prepared_keypoints: PreparedKeypoints | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield ``(rgb_1, alpha_1)`` per frame; warp once, everything else per frame.
 
@@ -66,7 +68,10 @@ def render_chunk_streaming(
     with a per-frame ``pack_frames`` + H2D copy.
     """
     n = len(motions)
-    x_s, x_d_all = motion_stitch(avatar.kp_info, motions, stitch=stitch)
+    prepared = prepared_keypoints or prepare_keypoints(avatar.kp_info, motions, stitch=stitch)
+    x_s, x_d_all = prepared.source, prepared.driving_final
+    if x_d_all.shape[0] != n:
+        raise ValueError("prepared keypoint frame count does not match motion frame count")
     f_s_b = avatar.f_s.expand(n, -1, -1, -1, -1).contiguous()
     x_s_b = x_s.expand_as(x_d_all).contiguous()
     warped = warp(
@@ -79,7 +84,9 @@ def render_chunk_streaming(
         face = torch.empty((1, 3, 512, 512), dtype=torch.float32, device="cuda")
         decoder(DecoderInput(feature=warped[i : i + 1]), out=DecoderOutput(output=face))
         face.clamp_(0.0, 1.0)
+        record_pixel_stage("decoded_face", face)
         rgb, alpha = putback_chunk(face, avatar, bg, matting=matting)
+        record_pixel_stage("final_composite", rgb)
         if collect_diagnostics:
             alpha_mean, alpha_coverage = alpha_frame_metrics(alpha)
             alpha_means.append(alpha_mean)
@@ -102,6 +109,7 @@ def render_chunk(
     warp: WarpEngine,
     decoder: DecoderEngine,
     matting: MODNetEngine,
+    prepared_keypoints: PreparedKeypoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Render an entire chunk in one batched pass.
 
@@ -134,7 +142,10 @@ def render_chunk(
     """
     n = len(motions)
     # Batched: x_s is (1, 21, 3), x_d_all is (N, 21, 3).
-    x_s, x_d_all = motion_stitch(avatar.kp_info, motions, stitch=stitch)
+    prepared = prepared_keypoints or prepare_keypoints(avatar.kp_info, motions, stitch=stitch)
+    x_s, x_d_all = prepared.source, prepared.driving_final
+    if x_d_all.shape[0] != n:
+        raise ValueError("prepared keypoint frame count does not match motion frame count")
     f_s_b = avatar.f_s.expand(n, -1, -1, -1, -1).contiguous()
     x_s_b = x_s.expand_as(x_d_all).contiguous()
     warped = warp(
@@ -146,7 +157,9 @@ def render_chunk(
         face_slot.output = faces[i : i + 1]
         decoder(DecoderInput(feature=warped[i : i + 1]), out=face_slot)
     faces.clamp_(0.0, 1.0)
+    record_pixel_stage("decoded_face", faces)
     rgb, alpha = putback_chunk(faces, avatar, bg, matting=matting)
+    record_pixel_stage("final_composite", rgb)
     if diagnostics_enabled():
         alpha_mean, alpha_coverage = alpha_frame_metrics(alpha)
         record_render_alpha(

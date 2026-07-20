@@ -19,9 +19,8 @@ stays at the source portrait's value. This module:
 Batched along the leading frame dim. ``MotionFrame`` carries N motions
 stacked as ``(N, 3, 3)`` rotation + ``(N, len(LIPSYNC_COORDS))`` exp; the
 math (delta build, driving transform, source transform) is one op for any
-N. The stitch TRT engine takes batch=1 inputs, so it's iterated inside
-``motion_stitch``; the warp / decoder / matting downstream of it iterate
-the same way.
+N. The batch-dynamic stitch engine receives the complete motion chunk in one
+call.
 """
 
 from __future__ import annotations
@@ -33,10 +32,20 @@ import torch
 
 from avtr1_renderer.constants import LIPSYNC_COORDS
 from avtr1_renderer.diagnostics import record_keypoint_geometry
+from avtr1_renderer.keypoint_stabilizer import (
+    KeypointStabilizationResult,
+    KeypointStabilizerState,
+    stabilize_keypoints,
+)
 from avtr1_renderer.models.stitch import StitchEngine, StitchInput
-from avtr1_renderer.types import KPInfo
+from avtr1_renderer.stage_artifacts import record_geometry_stage
+from avtr1_renderer.types import GeometryStabilizationOptions, KPInfo
 
 _LIPSYNC_INDEX = list(LIPSYNC_COORDS)
+if len(_LIPSYNC_INDEX) != len(set(_LIPSYNC_INDEX)):
+    raise RuntimeError(
+        "LIPSYNC_COORDS must be unique; duplicate CUDA advanced-index writes are nondeterministic"
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -85,6 +94,17 @@ class MotionFrame:
         return MotionFrame(R=self.R[idx], exp=self.exp[idx])
 
 
+@dataclass(slots=True, frozen=True)
+class PreparedKeypoints:
+    """All keypoint stages required to render and diagnose one motion chunk."""
+
+    source: torch.Tensor
+    driving_raw: torch.Tensor
+    driving_network: torch.Tensor
+    driving_final: torch.Tensor
+    stabilization: KeypointStabilizationResult
+
+
 def _transform_source(kp_info: KPInfo) -> torch.Tensor:
     """Transform the source canonical keypoints into pixel space.
 
@@ -106,12 +126,9 @@ def _build_x_d_delta(motion: MotionFrame, kp_info: KPInfo) -> torch.Tensor:
 
     Batched along the frame dim: ``motion`` carries ``N >= 1`` frames, the
     output is ``(N, 21, 3)``. Mirrors the reference's
-    ``delta_new[:, LIPSYNC_COORDS] = motion.exp`` per frame -- and yes,
-    ``LIPSYNC_COORDS`` contains a duplicate (54 appears at index 30 and
-    32) so the second write wins for that slot. The duplicate-write is
-    nondeterministic on CUDA (and stays nondeterministic in batched form,
-    independently per row), which is why parity tests mask out keypoint
-    18 (= flat index 54).
+    ``delta_new[:, LIPSYNC_COORDS] = motion.exp`` per frame. The module-level
+    uniqueness assertion prevents nondeterministic duplicate CUDA writes if a
+    future mapping change accidentally targets one flattened coordinate twice.
     """
     n = motion.R.shape[0]
     delta = kp_info.exp.flatten(1).expand(n, -1).clone()  # (N, 63)
@@ -139,13 +156,15 @@ def _transform_driving(
     return x_d
 
 
-def motion_stitch(
+def prepare_keypoints(
     kp_info: KPInfo,
     motions: MotionFrame,
     *,
     stitch: StitchEngine,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(x_s, x_d)`` keypoint pairs ready for the warp network.
+    options: GeometryStabilizationOptions | None = None,
+    state: KeypointStabilizerState | None = None,
+) -> PreparedKeypoints:
+    """Build, stitch, optionally stabilize, and diagnose driving keypoints.
 
     Args:
         kp_info: source-side keypoint bundle from the avatar (per-avatar,
@@ -153,15 +172,12 @@ def motion_stitch(
         motions: ``N`` motion frames stacked. ``N=1`` is a normal case --
             a single-frame caller passes ``MotionFrame`` with leading dim
             1 and gets ``(1, 21, 3)`` outputs back.
-        stitch: stitch-network engine that refines the driving keypoints
-            (closes the mouth-region seam). The engine takes batch=1
-            inputs, so it's iterated inside this function.
+        stitch: batch-dynamic stitch-network engine that refines the driving
+            keypoints (closes the mouth-region seam).
 
     Returns:
-        Tuple ``(x_s, x_d)``:
-            - ``x_s``: ``(1, 21, 3)`` source keypoints, on CUDA float32.
-            - ``x_d``: ``(N, 21, 3)`` driving keypoints, one per input
-              frame, post-stitch.
+        A :class:`PreparedKeypoints` containing source, raw driving,
+        stitch-network, final driving, and stabilization state/diagnostics.
 
     The stitch engine is built batch-dynamic (b=1..5), so this is a
     single call -- no per-frame Python loop, no per-call kernel launch
@@ -178,11 +194,68 @@ def motion_stitch(
 
     n = x_d_raw.shape[0]
     x_s_b = x_s.expand(n, -1, -1).contiguous()
-    x_d = stitch(
+    x_d_network = stitch(
         StitchInput(kp_source=x_s_b, kp_driving=x_d_raw.contiguous())
     ).out
-    record_keypoint_geometry(x_s, x_d_raw, x_d)
-    return x_s, x_d
+    if x_d_network.shape != x_d_raw.shape:
+        raise ValueError(
+            "stitch network returned an unexpected keypoint shape: "
+            f"expected {tuple(x_d_raw.shape)}, got {tuple(x_d_network.shape)}"
+        )
+    if options is None:
+        options = GeometryStabilizationOptions()
+    stabilization = stabilize_keypoints(
+        x_s,
+        x_d_raw,
+        x_d_network,
+        options=options,
+        state=state,
+    )
+    record_geometry_stage("source_keypoints", x_s)
+    record_geometry_stage("driving_raw", x_d_raw)
+    record_geometry_stage("driving_network", x_d_network)
+    record_geometry_stage("driving_final", stabilization.final)
+    record_geometry_stage("stitch_network_correction", stabilization.network_correction)
+    record_geometry_stage(
+        "stitch_filtered_correction",
+        stabilization.filtered_stitch_correction,
+    )
+    record_geometry_stage(
+        "stitch_temporal_correction",
+        stabilization.stitch_temporal_correction,
+    )
+    record_geometry_stage("aligned_residual_raw", stabilization.aligned_residual_raw)
+    record_geometry_stage(
+        "aligned_residual_corrected",
+        stabilization.aligned_residual_corrected,
+    )
+    record_geometry_stage("post_stitch_correction", stabilization.post_stitch_correction)
+    record_keypoint_geometry(
+        x_s,
+        x_d_raw,
+        x_d_network,
+        stabilization.final,
+        stabilization=stabilization,
+        options=options,
+    )
+    return PreparedKeypoints(
+        source=x_s,
+        driving_raw=x_d_raw,
+        driving_network=x_d_network,
+        driving_final=stabilization.final,
+        stabilization=stabilization,
+    )
 
 
-__all__ = ["MotionFrame", "motion_stitch"]
+def motion_stitch(
+    kp_info: KPInfo,
+    motions: MotionFrame,
+    *,
+    stitch: StitchEngine,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compatibility wrapper returning default post-stitch keypoints."""
+    prepared = prepare_keypoints(kp_info, motions, stitch=stitch)
+    return prepared.source, prepared.driving_final
+
+
+__all__ = ["MotionFrame", "PreparedKeypoints", "motion_stitch", "prepare_keypoints"]

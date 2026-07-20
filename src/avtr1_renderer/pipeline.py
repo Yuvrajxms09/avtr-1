@@ -31,6 +31,7 @@ requires TRT (run ``scripts/build_avtr1_engines.py`` before first use).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import torch
 
@@ -46,6 +47,7 @@ from avtr1_renderer.avtr1_motion_generator import (
     Normalizer,
 )
 from avtr1_renderer.backgrounds import load_background
+from avtr1_renderer.components.liveportrait.motion_stitch import prepare_keypoints
 from avtr1_renderer.diagnostics import new_trace_id, record_options, trace_scope
 from avtr1_renderer.frame_sink import pack_frames
 from avtr1_renderer.models.avtr1 import (
@@ -59,7 +61,8 @@ from avtr1_renderer.models.hubert import HubertInput, HubertOutput
 from avtr1_renderer.models.matting import MODNetEngine, MODNetInput, MODNetOutput
 from avtr1_renderer.models.stitch import StitchEngine, StitchInput, StitchOutput
 from avtr1_renderer.models.warp import WarpEngine, WarpInput, WarpOutput
-from avtr1_renderer.motion_generator import MotionGenerator
+from avtr1_renderer.keypoint_stabilizer import source_locked_keypoint_indices
+from avtr1_renderer.motion_generator import GeometryStatefulMotionGenerator, MotionGenerator
 from avtr1_renderer.renderer import render_chunk, render_chunk_streaming
 from avtr1_renderer.runtime import load_engine
 from avtr1_renderer.types import Chunk, FrameIterator, RenderOptions
@@ -102,6 +105,7 @@ class Pipeline[StateT]:
         download_workers: int = 4,
         crop_config: CropConfig | None = None,
         n_ode_steps: int = 5,
+        renderer_backend: Literal["auto", "onnx"] = "auto",
     ) -> tuple[Pipeline, dict[str, Avatar]]:
         """Build the Pipeline + avatar registry from downloaded artifacts.
 
@@ -128,7 +132,12 @@ class Pipeline[StateT]:
                               :class:`CropConfig` values.
             n_ode_steps:      Number of flow-integration time points. Must be
                               at least 2; the default preserves existing output.
+            renderer_backend: ``"auto"`` prefers TensorRT. ``"onnx"`` forces
+                              the FP32-capable ONNX renderer reference path for
+                              deterministic stage-localization experiments.
         """
+        if renderer_backend not in {"auto", "onnx"}:
+            raise ValueError(f"Unknown renderer backend: {renderer_backend!r}")
         from avtr1_renderer.avatar_loader import AvatarLoader
 
         out_h, out_w = out_size
@@ -176,15 +185,20 @@ class Pipeline[StateT]:
         )
 
         # --- Renderer engines: TRT if built, else ONNX ----------------------
+        def renderer_path(engine_name: str, onnx_artifact: str) -> Path:
+            if renderer_backend == "onnx":
+                return mgr.get_artifact_path(onnx_artifact)
+            return find_engine_or_onnx(engine_name, onnx_artifact)
+
         decoder = load_engine(
-            find_engine_or_onnx("decoder", "decoder_onnx"),
+            renderer_path("decoder", "decoder_onnx"),
             DecoderInput,
             DecoderOutput,
         )
 
         # Warp needs the grid-sample plugin when running in TRT mode.
         warp_trt = get_trt_engine_path("warp_network")
-        if warp_trt.is_file():
+        if renderer_backend == "auto" and warp_trt.is_file():
             plugin_path = mgr.storage_path("warp_plugin")
             warp = load_engine(
                 warp_trt, WarpInput, WarpOutput,
@@ -192,18 +206,18 @@ class Pipeline[StateT]:
             )
         else:
             warp = load_engine(
-                find_engine_or_onnx("warp_network", "warp_network_onnx"),
+                renderer_path("warp_network", "warp_network_onnx"),
                 WarpInput,
                 WarpOutput,
             )
 
         stitch = load_engine(
-            find_engine_or_onnx("stitch_network", "stitch_network_onnx"),
+            renderer_path("stitch_network", "stitch_network_onnx"),
             StitchInput,
             StitchOutput,
         )
         matting = load_engine(
-            find_engine_or_onnx("modnet", "modnet_onnx"),
+            renderer_path("modnet", "modnet_onnx"),
             MODNetInput,
             MODNetOutput,
         )
@@ -281,6 +295,23 @@ class Pipeline[StateT]:
         if state is None:
             state = self._motion_generator.initial_state(avatar)
         mg = self._motion_generator
+        geometry_stateful = isinstance(mg, GeometryStatefulMotionGenerator)
+        keypoint_count = avatar.kp_info.kp.shape[1]
+        options.geometry.validate(keypoint_count=keypoint_count)
+        if options.geometry.post_stitch_enabled:
+            selected = options.geometry.post_stitch_keypoint_indices
+            allowed = set(source_locked_keypoint_indices(keypoint_count))
+            unsafe = sorted(set(selected or allowed) - allowed)
+            if unsafe:
+                raise ValueError(
+                    "post-stitch stabilization cannot target lipsync keypoints: "
+                    f"{unsafe}"
+                )
+        if options.geometry.enabled and not geometry_stateful:
+            raise TypeError(
+                "Geometry stabilization requires a motion generator that carries "
+                "KeypointStabilizerState"
+            )
         expected_len = (mg.chunk_size + mg.future_size) * mg.frame_len + mg.audio_shift
         got_len = len(chunk.audio_speech)
         if got_len != expected_len:
@@ -304,6 +335,22 @@ class Pipeline[StateT]:
             motions, next_state = self._motion_generator.generate_chunk(
                 chunk, avatar, state, options
             )
+            prepared_keypoints = None
+            if options.geometry.enabled:
+                assert geometry_stateful
+                prepared_keypoints = prepare_keypoints(
+                    avatar.kp_info,
+                    motions,
+                    stitch=self._stitch,
+                    options=options.geometry,
+                    state=mg.keypoint_stabilizer_state(state),
+                )
+                next_state = mg.with_keypoint_stabilizer_state(
+                    next_state,
+                    prepared_keypoints.stabilization.state,
+                )
+            elif geometry_stateful and mg.keypoint_stabilizer_state(state) is not None:
+                next_state = mg.with_keypoint_stabilizer_state(next_state, None)
 
         def frames_streaming() -> FrameIterator:
             with trace_scope(trace_id):
@@ -313,6 +360,7 @@ class Pipeline[StateT]:
                     warp=self._warp,
                     decoder=self._decoder,
                     matting=self._matting,
+                    prepared_keypoints=prepared_keypoints,
                 )
                 for rgb, alpha in stream:
                     packed = pack_frames(rgb, alpha, pixel_format=options.pixel_format)
@@ -326,6 +374,7 @@ class Pipeline[StateT]:
                     warp=self._warp,
                     decoder=self._decoder,
                     matting=self._matting,
+                    prepared_keypoints=prepared_keypoints,
                 )
                 yield from pack_frames(rgb, alpha, pixel_format=options.pixel_format)
 

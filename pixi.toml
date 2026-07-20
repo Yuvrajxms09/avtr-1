@@ -13,6 +13,7 @@ download         = { cmd = "python scripts/download_artifacts.py", description =
 generate_offline = { cmd = "python scripts/generate_offline.py", description = "Run end-to-end offline generation (requires built engines)" }
 analyze-expression-sensitivity = { cmd = "python scripts/analyze_expression_sensitivity.py", description = "Render per-coordinate AVTR-1 expression sensitivity artifacts" }
 sweep-rotation-stabilization = { cmd = "python scripts/sweep_rotation_stabilization.py", description = "Run and summarize a temporal-filter configuration sweep" }
+analyze-morphing-stages = { cmd = "python scripts/analyze_morphing_stages.py", description = "Analyze deterministic keypoint and pixel stage captures" }
 
 [dependencies]
 python = "==3.12"

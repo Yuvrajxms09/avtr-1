@@ -14,8 +14,9 @@ Highlights:
   times for Euler integration of the flow field.
 - **CFG inside the engine.** The four-pass classifier-free-guidance batch
   (past / self-audio / other-audio / kp) is internal to the decode TRT
-  engine, with weights baked at build time. The runtime sees a single
-  prediction per ODE step, not multiple condition modes.
+  engine. Runtime weights are supplied as decode inputs each chunk. The
+  runtime sees a single prediction per ODE step, not multiple condition
+  modes.
 - **Long audio context, but cheap to extend.** The model wants
   ``past + chunk + future = 85`` audio features per call, but we only
   HuBERT a ``(3, 5, 5)`` window every chunk -- the past 75 features are
@@ -57,7 +58,7 @@ Per-chunk flow:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import roma
@@ -74,7 +75,9 @@ from avtr1_renderer.diagnostics import (
     record_audio_chunk,
     record_motion_prediction,
     record_motion_stabilization,
+    record_turn_guidance,
 )
+from avtr1_renderer.keypoint_stabilizer import KeypointStabilizerState
 from avtr1_renderer.models.avtr1 import (
     Avtr1DecodeEngine,
     Avtr1DecodeInput,
@@ -86,6 +89,8 @@ from avtr1_renderer.motion_stabilizer import (
     MotionStabilizerState,
     stabilize_normalized_motion,
 )
+from avtr1_renderer.motion_trajectory import intercept_raw_motion
+from avtr1_renderer.turn_guidance import TurnGuidanceState, update_turn_guidance
 from avtr1_renderer.types import Chunk, RenderOptions
 
 N_LIPSYNC = len(LIPSYNC_COORDS)
@@ -141,6 +146,42 @@ def state_to_safetensors(state: AVTR1State) -> bytes:
             value = getattr(stabilizer, name)
             if value is not None:
                 tensors[f"stabilizer_{name}"] = value
+    keypoint_stabilizer = state.keypoint_stabilizer
+    if keypoint_stabilizer is not None:
+        tensors["keypoint_stabilizer_configuration_code"] = torch.tensor(
+            keypoint_stabilizer.configuration_code,
+            dtype=torch.int64,
+            device=state.past_cond.device,
+        )
+        for name in (
+            "stitch_position",
+            "stitch_filter_input",
+            "stitch_filter_derivative",
+            "residual_position",
+            "residual_filter_input",
+            "residual_filter_derivative",
+        ):
+            value = getattr(keypoint_stabilizer, name)
+            if value is not None:
+                tensors[f"keypoint_stabilizer_{name}"] = value
+    turn_guidance = state.turn_guidance
+    if turn_guidance is not None:
+        for name in (
+            "stable_state_code",
+            "pending_state_code",
+            "pending_chunks",
+            "state_age_chunks",
+        ):
+            tensors[f"turn_guidance_{name}"] = torch.tensor(
+                getattr(turn_guidance, name),
+                dtype=torch.int64,
+                device=state.past_cond.device,
+            )
+        tensors["turn_guidance_effective_cfg_other_audio"] = torch.tensor(
+            turn_guidance.effective_cfg_other_audio,
+            dtype=torch.float32,
+            device=state.past_cond.device,
+        )
     return save(tensors)
 
 
@@ -170,6 +211,30 @@ def state_from_safetensors(blob: bytes, *, device: str | torch.device = "cuda") 
             expression_filter_input=moved.get("stabilizer_expression_filter_input"),
             expression_filter_derivative=moved.get("stabilizer_expression_filter_derivative"),
         )
+    keypoint_stabilizer = None
+    if "keypoint_stabilizer_configuration_code" in moved:
+        keypoint_stabilizer = KeypointStabilizerState(
+            configuration_code=int(moved["keypoint_stabilizer_configuration_code"].item()),
+            stitch_position=moved.get("keypoint_stabilizer_stitch_position"),
+            stitch_filter_input=moved.get("keypoint_stabilizer_stitch_filter_input"),
+            stitch_filter_derivative=moved.get("keypoint_stabilizer_stitch_filter_derivative"),
+            residual_position=moved.get("keypoint_stabilizer_residual_position"),
+            residual_filter_input=moved.get("keypoint_stabilizer_residual_filter_input"),
+            residual_filter_derivative=moved.get(
+                "keypoint_stabilizer_residual_filter_derivative"
+            ),
+        )
+    turn_guidance = None
+    if "turn_guidance_stable_state_code" in moved:
+        turn_guidance = TurnGuidanceState(
+            stable_state_code=int(moved["turn_guidance_stable_state_code"].item()),
+            pending_state_code=int(moved["turn_guidance_pending_state_code"].item()),
+            pending_chunks=int(moved["turn_guidance_pending_chunks"].item()),
+            state_age_chunks=int(moved["turn_guidance_state_age_chunks"].item()),
+            effective_cfg_other_audio=float(
+                moved["turn_guidance_effective_cfg_other_audio"].item()
+            ),
+        )
     return AVTR1State(
         audio_prev_speech=moved["audio_prev_speech"],
         audio_prev_listen=moved["audio_prev_listen"],
@@ -177,6 +242,8 @@ def state_from_safetensors(blob: bytes, *, device: str | torch.device = "cuda") 
         past_cond=moved["past_cond"],
         noise_shared=moved.get("noise_shared"),
         stabilizer=stabilizer,
+        keypoint_stabilizer=keypoint_stabilizer,
+        turn_guidance=turn_guidance,
     )
 
 
@@ -207,6 +274,8 @@ class AVTR1State:
     past_cond: torch.Tensor  # (1, past_size, nfeats) float32 CUDA, normalised motion
     noise_shared: torch.Tensor | None  # (1, 1, nfeats) CUDA AR(1) carry, or None on cold start
     stabilizer: MotionStabilizerState | None = None
+    keypoint_stabilizer: KeypointStabilizerState | None = None
+    turn_guidance: TurnGuidanceState | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +491,20 @@ class AVTR1MotionGenerator:
             past_cond=past_cond.contiguous(),
             noise_shared=None,
             stabilizer=None,
+            keypoint_stabilizer=None,
+            turn_guidance=None,
         )
+
+    @staticmethod
+    def keypoint_stabilizer_state(state: AVTR1State) -> KeypointStabilizerState | None:
+        return state.keypoint_stabilizer
+
+    @staticmethod
+    def with_keypoint_stabilizer_state(
+        state: AVTR1State,
+        keypoint_stabilizer: KeypointStabilizerState | None,
+    ) -> AVTR1State:
+        return replace(state, keypoint_stabilizer=keypoint_stabilizer)
 
     # -- Per-chunk -----------------------------------------------------------
 
@@ -448,6 +530,24 @@ class AVTR1MotionGenerator:
             device, dtype=torch.float32, non_blocking=True
         )
         record_audio_chunk(chunk_speech, chunk_listen)
+        current_samples = self.chunk_size * self.frame_len
+        speech_rms = 0.0
+        listen_rms = 0.0
+        if options.turn_guidance.enabled:
+            speech_rms = float(
+                chunk_speech[:current_samples].square().mean().sqrt().item()
+            )
+            listen_rms = float(
+                chunk_listen[:current_samples].square().mean().sqrt().item()
+            )
+        guidance = update_turn_guidance(
+            options.turn_guidance,
+            state=state.turn_guidance,
+            fallback_cfg_other_audio=options.cfg_other_audio,
+            speech_rms=speech_rms,
+            listen_rms=listen_rms,
+        )
+        record_turn_guidance(options.turn_guidance, guidance)
         full_speech = torch.cat([state.audio_prev_speech, chunk_speech], dim=0)
         full_listen = torch.cat([state.audio_prev_listen, chunk_listen], dim=0)
 
@@ -527,7 +627,10 @@ class AVTR1MotionGenerator:
             (self.latent_dim,), options.cfg_self_audio, device=device, dtype=torch.float32
         )
         w_other = torch.full(
-            (self.latent_dim,), options.cfg_other_audio, device=device, dtype=torch.float32
+            (self.latent_dim,),
+            guidance.effective_cfg_other_audio,
+            device=device,
+            dtype=torch.float32,
         )
         w_kp = torch.full((self.latent_dim,), options.cfg_kp, device=device, dtype=torch.float32)
         # Pre-build the full ``t`` schedule on GPU as one contiguous
@@ -558,7 +661,15 @@ class AVTR1MotionGenerator:
                 out=v_out,
             )
             x.add_(v_buf, alpha=dt)
-        # ``x`` remains the model-native prediction stored in autoregressive
+        # Capture returns the generated tensor unchanged. Replay replaces it
+        # with the fingerprint-validated captured tensor at this single raw
+        # boundary, before renderer filtering and autoregressive history.
+        x = intercept_raw_motion(
+            x,
+            so3_offset=self._normalizer.offset_so3,
+            so3_scale=self._normalizer.scale_so3,
+        )
+        # ``x`` remains the raw prediction stored in autoregressive
         # history. Stabilization corrects only the copy sent to the renderer,
         # avoiding a distribution shift in future model calls.
         raw_motions = self._motion_to_frames(x)
@@ -609,6 +720,8 @@ class AVTR1MotionGenerator:
             past_cond=new_past_cond.contiguous(),
             noise_shared=next_noise_shared,
             stabilizer=next_stabilizer,
+            keypoint_stabilizer=state.keypoint_stabilizer,
+            turn_guidance=guidance.state,
         )
         return motions, next_state
 

@@ -1,9 +1,12 @@
 # AVTR-1 Motion Stability Handoff
 
-Last updated: 2026-07-17
+Last updated: 2026-07-18
 Repository: `https://github.com/Yuvrajxms09/avtr-1`
 Branch: `main`
 Current implementation commit: `429af51` (`Add layered temporal stabilization sweep`)
+Current working tree: deterministic replay, stage capture/analysis,
+post-stitch experiment controls, and turn-aware CFG guidance implemented but
+not yet built, tested, or validated on CUDA.
 
 ## 1. Purpose of this document
 
@@ -43,6 +46,8 @@ the following status vocabulary exactly:
 - **Observed:** directly present in a completed video, trace, or metric output.
 - **Tested candidate:** evaluated against baseline, but not necessarily ready
   for production.
+- **Source-implemented, unverified:** code exists in the current working tree,
+  but no build, test, or CUDA execution has been run for those changes.
 - **Implemented, not validated:** code exists and passed local CPU/static tests,
   but the real CUDA/TensorRT experiment has not run.
 - **Hypothesis:** a possible explanation that still needs an isolating test.
@@ -63,8 +68,9 @@ Current state snapshot:
 | Rotation acceleration/jerk limiters | Tested and rejected at current settings | They reduced selected derivatives by increasing head step or boundary movement. |
 | Expression temporal filters and four-coordinate profile | Tested, not accepted | The filters changed the intended coordinates, but rendered face/lipsync improvements were too small and confounded by raw-run variation. |
 | Facial morphing fix | Not established | Rotation filtering barely changed face/lipsync size metrics; expression filtering did not produce a causal improvement. |
-| Active morphing investigation | Proposed, not implemented | Capture one raw trajectory, localize the first unstable stage, then test stitch control and one bounded post-stitch stabilizer before considering renderer/model work. |
-| Turn-aware CFG switching | Proposed production prototype | Existing runtime controls support it, but transition behavior has not been tested. |
+| Deterministic replay and stage capture | Source-implemented, unverified | Raw motion capture/replay, fingerprint assertions, geometry/pixel stage artifacts, and rigid-aligned analysis are present but have not been executed. |
+| Stitch/post-stitch controls | Source-implemented, unverified | Stitch strength/filtering and a source-locked non-rigid prototype are default-disabled and require deterministic evidence before use. |
+| Turn-aware CFG switching | Source-implemented, unverified | Default-disabled chunk controller supports automatic RMS classification or explicit upstream state, hysteresis, interpolation, overlap/silence hold, diagnostics, and serialized carry. |
 
 The head-jitter parameter/filter investigation is near saturation. Moderate
 rotation-only One Euro is the current head-stability candidate; more broad
@@ -74,13 +80,13 @@ is also near saturation as a morphing solution. It remains useful for diagnosis,
 but it did not materially reduce the visible defect and must not be repeated as
 another broad sweep.
 
-The immediate next task is deterministic morphing-stage isolation. Generate one
-raw trajectory once, persist it, and pass that identical trajectory through all
-candidate branches. Compare raw driving geometry, stitched geometry, decoded
-face crops, and final composited frames in order. This removes the observed
-TensorRT/run-to-run motion differences and determines whether morphing first
-appears in model motion, stitch correction, warp/decoder output, or final
-compositing.
+The immediate next task is to run and validate the new deterministic
+morphing-stage isolation path on CUDA. Generate one raw trajectory once, then
+replay it through baseline and candidate branches. Compare raw driving
+geometry, stitch-network geometry, final geometry, decoded face crops, and
+final composited frames in order. This removes the observed TensorRT/run-to-run
+motion differences and determines whether morphing first appears in model
+motion, stitch correction, warp/decoder output, or final compositing.
 
 Non-negotiable instructions for the next agent:
 
@@ -689,30 +695,34 @@ tracks. Re-run baseline with the current commit when using the new sweep.
 
 ### 10.6 Important functionality that is not implemented yet
 
-The current repository does **not** yet contain:
+The current repository still does **not** contain:
 
-- A deterministic raw-motion capture/replay harness for rendering multiple
-  filters from one identical model trajectory.
-- A rigid-aligned stage-localization analyzer spanning raw keypoints, stitched
-  keypoints, decoded face crops, and final composited frames.
-- Stitch-strength control or temporal filtering of stitch corrections.
-- Post-stitch non-rigid keypoint stabilization.
-- Capture of decoded face crops before pasteback/matting for renderer isolation.
 - An automatic analyzer that correlates all 39 real-time expression coordinate
   traces with per-keypoint or region-level morphing events.
 - A trusted mapping from learned coordinates/keypoints to anatomical names.
 - Automatic creation of a nonzero expression filter profile.
 - An external audio/video lip-sync confidence evaluator.
-- A turn-state controller that switches/interpolates speaking and listening
-  CFG values.
 - Automatic production rollout, feature flagging, or A/B telemetry.
 - A model-training fix or access to retraining losses/data.
 - Face-aware post-render stabilization or optical-flow restoration.
 
-The keypoint diagnostics needed to begin stage localization are present. The
-broad rotation/expression sweep is complete. Deterministic motion replay and
-rigid-aligned stage localization are the next implementation tasks; expression
-correlation is conditional on raw driving geometry being implicated.
+The 2026-07-18 working tree now contains, but has not validated on CUDA:
+
+- Fingerprinted raw normalized-motion capture/replay with strict metadata and
+  complete-consumption checks.
+- Hash-verified raw, stitch-network, and final keypoint artifacts.
+- Optional lossless decoded-face and final-composite frame capture.
+- A rigid-aligned geometry and secondary pixel-motion comparison analyzer.
+- Default-disabled stitch strength, stitch-correction One Euro filtering, and
+  post-stitch source-locked residual filtering with serialized carry.
+- Default-disabled turn-aware `cfg_other_audio` selection with RMS Schmitt
+  thresholds, chunk hysteresis/interpolation, and serialized carry.
+
+The keypoint diagnostics and implementation needed to begin stage localization
+are present. The broad rotation/expression sweep is complete. The next task is
+CUDA validation of capture/replay integrity and baseline stage localization;
+expression correlation remains conditional on raw driving geometry being
+implicated.
 
 ## 11. Completed comprehensive temporal-stability experiment
 
@@ -973,15 +983,18 @@ Euro across:
 - Listening, silence, interruption, and overlap using the dual-audio path.
 - External lip-sync confidence and mouth-range preservation.
 
-Only then prototype turn-aware serving:
+The working tree now contains the default-disabled turn-aware serving
+prototype:
 
 ```text
 avatar speaking  -> cfg_other_audio = 1.0
 avatar listening -> cfg_other_audio = 2.0
 ```
 
-The filter state and CFG transition must be interpolated or switched with
-hysteresis so a turn boundary does not create a new discontinuity.
+Its transition state is serialized and uses chunk hysteresis/interpolation so a
+turn boundary does not create a hard CFG discontinuity. It still requires the
+same CUDA validation across interruption, overlap, silence, and restored API
+state before production use.
 
 ### 12.4 Confounders to control
 
@@ -1255,7 +1268,9 @@ single-coordinate A/B described above is the causal confirmation step.
 
 This is the active investigation for the manager-reported facial-region size
 changes. It supersedes broader expression-coordinate tuning as the primary
-morphing direction. No step below is an implemented or accepted fix yet.
+morphing direction. The diagnostic capture/analyzer and bounded runtime
+controls below are implemented, but no morphing fix has been accepted or
+validated yet.
 
 #### 13.6.1 Pipeline and stage-localization order
 
@@ -1657,7 +1672,8 @@ must not be used to claim production throughput.
 
 ## 19. Current verification status
 
-Completed locally without installing the CUDA renderer stack:
+Completed locally for the earlier stabilization implementation before the
+current uncommitted working-tree changes:
 
 - CPU behavior tests for disabled identity behavior.
 - Isolated spike suppression.
@@ -1673,9 +1689,13 @@ Completed locally without installing the CUDA renderer stack:
 
 Still required in Colab:
 
+- Run the newly added unit tests and static tooling for deterministic replay,
+  stage artifacts/analysis, geometry stabilization, state carry, and turn
+  guidance; none were executed while authoring the current source changes.
 - Runtime state serialization test with the actual environment.
 - Multi-avatar and multi-audio validation.
-- Deterministic raw-motion replay for causal filter comparisons.
+- End-to-end validation of deterministic capture/replay fingerprints, stage
+  artifact integrity, and analyzer output on the real CUDA/TensorRT path.
 - External lip-sync and mouth-range validation.
 - Production API transition/interrupt/overlap testing.
 
@@ -1713,13 +1733,15 @@ A candidate should not be enabled globally until all of the following are true:
 
 ## 20. Recommended next decisions
 
-1. Implement deterministic raw-motion capture/replay for causal A/B rendering.
-2. Localize the first unstable stage using rigid-aligned raw keypoints, stitched
-   keypoints, decoded face crops, and final frames from that replay.
-3. If stitching is implicated, run the fixed `0.00/0.25/0.50/0.75/1.00`
-   stitch-strength A/B and one weak stitch-correction filter.
-4. If final keypoint geometry is implicated, implement and test one bounded
-   post-stitch non-lipsync shape stabilizer.
+1. Run one CUDA raw-motion capture and verify its stored fingerprint and
+   metadata manifest.
+2. Replay the capture into a default baseline with geometry and lossless pixel
+   stage artifacts, then run the rigid-aligned analyzer.
+3. If stitching is implicated, run the implemented fixed
+   `0.00/0.25/0.50/0.75/1.00` stitch-strength A/B and one weak
+   stitch-correction filter against the identical fingerprint.
+4. If final keypoint geometry is implicated, validate the implemented bounded
+   post-stitch source-locked stabilizer with lipsync keypoints untouched.
 5. If stable keypoints still render unstable pixels, compare TensorRT FP16 with
    a feasible higher-precision reference and separate decoded-face instability
    from pasteback/matting instability.
@@ -1730,8 +1752,9 @@ A candidate should not be enabled globally until all of the following are true:
    filter work and scope renderer/model retraining or replacement.
 8. In parallel, validate moderate and light rotation One Euro across multiple
    captured trajectories and test listening, silence, interruption, and overlap.
-9. Prototype turn-aware `cfg_other_audio` switching with hysteresis only after
-   filter behavior is stable across turn boundaries.
+9. Validate the implemented turn-aware `cfg_other_audio` controller across
+   speaking, listening, interruption, overlap, silence, and serialized API
+   state; keep it disabled until filter behavior is stable at turn boundaries.
 10. Add a final global correction cap only if layered rotation filters are ever
     reconsidered; the current pure One Euro candidate does not require layering.
 

@@ -43,10 +43,13 @@ from avtr1_renderer.constants import LIPSYNC_COORDS
 from avtr1_renderer.pipeline import TRANSPARENT_BG_ID, Pipeline
 from avtr1_renderer.types import (
     Chunk,
+    GeometryStabilizationOptions,
     MotionStabilizationMode,
     MotionStabilizationOptions,
     RenderOptions,
     TemporalFilterMode,
+    TurnAwareGuidanceOptions,
+    TurnGuidanceMode,
 )
 from avtr1_renderer.utils.asyncio import run_in_thread
 from avtr1_renderer.utils.cuda_health import CudaHealthChecker
@@ -194,6 +197,18 @@ def _parse_expression_weights(value: str | None) -> tuple[float, ...] | None:
     return weights
 
 
+def _parse_keypoint_indices(value: str | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    try:
+        return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="post_stitch_keypoints must be comma-separated integers",
+        ) from exc
+
+
 @app.post("/process-audio-v3")
 async def process_audio_v3(
     request: Request,
@@ -234,6 +249,29 @@ async def process_audio_v3(
     expression_max_acceleration_z: float = 0.0,
     expression_max_jerk_z: float = 0.0,
     expression_stabilization_weights: str | None = None,
+    stitch_strength: float = 1.0,
+    stitch_temporal_filter: TemporalFilterMode = "none",
+    stitch_one_euro_min_cutoff_hz: float = 3.0,
+    stitch_one_euro_beta: float = 0.2,
+    stitch_one_euro_derivative_cutoff_hz: float = 1.0,
+    stitch_temporal_max_correction: float = 0.01,
+    post_stitch_stabilization: bool = False,
+    post_stitch_one_euro_min_cutoff_hz: float = 3.0,
+    post_stitch_one_euro_beta: float = 0.2,
+    post_stitch_one_euro_derivative_cutoff_hz: float = 1.0,
+    post_stitch_strength: float = 1.0,
+    post_stitch_max_correction: float = 0.01,
+    post_stitch_keypoints: str | None = None,
+    turn_guidance: TurnGuidanceMode = "disabled",
+    speaking_cfg_other_audio: float = 1.0,
+    listening_cfg_other_audio: float = 2.0,
+    speech_rms_on: float = 0.01,
+    speech_rms_off: float = 0.005,
+    listen_rms_on: float = 0.01,
+    listen_rms_off: float = 0.005,
+    turn_hysteresis_chunks: int = 2,
+    turn_minimum_state_chunks: int = 2,
+    turn_transition_chunks: int = 2,
 ) -> StreamingResponse:
     pipeline: Pipeline = request.app.state.pipeline
     registry: dict = request.app.state.registry
@@ -289,6 +327,43 @@ async def process_audio_v3(
         stabilization.validate(expression_coordinates=len(LIPSYNC_COORDS))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        geometry = GeometryStabilizationOptions(
+            stitch_strength=stitch_strength,
+            stitch_temporal_filter=stitch_temporal_filter,
+            stitch_one_euro_min_cutoff_hz=stitch_one_euro_min_cutoff_hz,
+            stitch_one_euro_beta=stitch_one_euro_beta,
+            stitch_one_euro_derivative_cutoff_hz=stitch_one_euro_derivative_cutoff_hz,
+            stitch_temporal_max_correction=stitch_temporal_max_correction,
+            post_stitch_enabled=post_stitch_stabilization,
+            post_stitch_one_euro_min_cutoff_hz=post_stitch_one_euro_min_cutoff_hz,
+            post_stitch_one_euro_beta=post_stitch_one_euro_beta,
+            post_stitch_one_euro_derivative_cutoff_hz=(
+                post_stitch_one_euro_derivative_cutoff_hz
+            ),
+            post_stitch_strength=post_stitch_strength,
+            post_stitch_max_correction=post_stitch_max_correction,
+            post_stitch_keypoint_indices=_parse_keypoint_indices(post_stitch_keypoints),
+        )
+        geometry.validate(keypoint_count=21)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    guidance = TurnAwareGuidanceOptions(
+        mode=turn_guidance,
+        speaking_cfg_other_audio=speaking_cfg_other_audio,
+        listening_cfg_other_audio=listening_cfg_other_audio,
+        speech_rms_on=speech_rms_on,
+        speech_rms_off=speech_rms_off,
+        listen_rms_on=listen_rms_on,
+        listen_rms_off=listen_rms_off,
+        hysteresis_chunks=turn_hysteresis_chunks,
+        minimum_state_chunks=turn_minimum_state_chunks,
+        transition_chunks=turn_transition_chunks,
+    )
+    try:
+        guidance.validate()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     options = RenderOptions(
         pixel_format=pixel_format,
@@ -299,6 +374,8 @@ async def process_audio_v3(
         noise_alpha=noise_alpha,
         noise_trunc_z=noise_trunc_z,
         stabilization=stabilization,
+        geometry=geometry,
+        turn_guidance=guidance,
     )
 
     loop = asyncio.get_running_loop()

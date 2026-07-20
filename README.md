@@ -158,9 +158,31 @@ pixi run generate_offline \
 
 Each JSONL event includes a per-chunk `trace_id`. The main stages are
 `avatar_registration`, `audio_chunk`, `motion_prediction`,
-`motion_stabilization`, `keypoint_geometry`, and `render_alpha`. Diagnostic
+`motion_stabilization`, `turn_guidance`, `motion_trajectory`, `keypoint_geometry`,
+`stage_artifact`, and `render_alpha`. Diagnostic
 metrics synchronize CUDA and reduce throughput, so do not use them for
 performance measurements.
+
+Turn-aware other-audio guidance is also opt-in. In automatic mode it classifies
+the current speech/listen audio with separate on/off RMS thresholds, requires a
+stable observation before changing state, and interpolates the CFG value across
+chunks. Overlap and silence hold the previous speaking/listening target:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --listen example/listener_1.ogg \
+  --turn-guidance auto \
+  --speaking-cfg-other-audio 1.0 \
+  --listening-cfg-other-audio 2.0 \
+  --turn-hysteresis-chunks 2 \
+  --turn-transition-chunks 2
+```
+
+Use `--turn-guidance speaking` or `listening` when a trusted upstream turn
+controller supplies the state. The controller state is included in the normal
+safetensors session blob. `disabled` remains the default and uses
+`--cfg-other-audio` exactly as before.
 
 ### Experimental motion stabilization
 
@@ -250,6 +272,103 @@ unchanged. The One Euro filter raises its cutoff during fast motion, preserving
 more speech articulation than a fixed low-pass filter. Each layer is bounded by
 its configured per-frame maximum; when layers are combined, their final summed
 correction can exceed one layer's cap.
+
+### Deterministic morphing-stage analysis
+
+Independent seeded TensorRT runs can produce different raw trajectories. Do
+not use them to attribute small rendered-geometry changes. Capture the raw
+normalized trajectory once:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --cfg-self-audio 2.0 \
+  --cfg-other-audio 1.0 \
+  --cfg-kp 3.0 \
+  --seed 1234 \
+  --motion-capture artifacts/maria-motion.safetensors \
+  --motion-debug-jsonl artifacts/capture.jsonl \
+  --out artifacts/capture.mp4
+```
+
+Replay validates the trajectory fingerprint, audio, avatar registration,
+chunking, and raw motion options before replacing the generated motion at the
+single pre-stabilization boundary. Capture the baseline stages losslessly:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --cfg-self-audio 2.0 \
+  --cfg-other-audio 1.0 \
+  --cfg-kp 3.0 \
+  --seed 1234 \
+  --motion-replay artifacts/maria-motion.safetensors \
+  --stage-capture-dir artifacts/baseline-stages \
+  --stage-capture-pixels \
+  --motion-debug-jsonl artifacts/baseline.jsonl \
+  --out artifacts/baseline.mp4
+```
+
+The stage directory contains a manifest, raw/network/final keypoint tensors,
+stitch corrections, and—when requested—lossless decoded-face and final-frame
+PNG sequences. Pixel capture is intentionally expensive and is not a
+throughput mode.
+
+Stitch controls are independent and disabled by default. For example, test one
+predeclared stitch strength against the same trajectory:
+
+```bash
+pixi run generate_offline \
+  --speech example/speaker_1.ogg \
+  --avatar maria \
+  --bg plain_white \
+  --cfg-self-audio 2.0 \
+  --cfg-other-audio 1.0 \
+  --cfg-kp 3.0 \
+  --seed 1234 \
+  --motion-replay artifacts/maria-motion.safetensors \
+  --stitch-strength 0.75 \
+  --stage-capture-dir artifacts/stitch-075-stages \
+  --stage-capture-pixels \
+  --motion-debug-jsonl artifacts/stitch-075.jsonl \
+  --out artifacts/stitch-075.mp4
+```
+
+Then rigid-align learned-keypoint geometry, validate every artifact hash, and
+compare only captures with the same raw-motion fingerprint:
+
+```bash
+pixi run analyze-morphing-stages \
+  --baseline artifacts/baseline-stages \
+  --candidate stitch075=artifacts/stitch-075-stages \
+  --out artifacts/morphing-stage-analysis.json
+```
+
+The analyzer reports raw, stitch-network, and final keypoint metrics for all,
+lipsync, and source-locked subsets. It removes translation, rotation, and
+uniform scale before non-rigid measurements, separates speaking, listening,
+overlap, and silence from captured per-frame audio RMS, and adds secondary
+optical-flow metrics for decoded and composited pixels. Its `10%` geometry and `5%`
+preservation fields are gates, not automatic approval; full-resolution visual
+review, mouth range, and an external lip-sync evaluator remain required.
+
+The post-stitch prototype is also disabled by default. It filters only an
+explicit reviewed keypoint subset (or the existing source-locked subset),
+restores the original per-frame 3D similarity transform, clamps every
+per-keypoint correction, and leaves all unselected/lipsync keypoints unchanged.
+Do not enable it until deterministic stage analysis implicates final keypoint
+geometry.
+
+If final stitched keypoints are stable but decoded pixels remain unstable,
+repeat the identical replay with `--renderer-backend onnx`. This forces the
+ONNX renderer models while keeping the AVTR-1 motion engines unchanged, so the
+stage report can compare the normal TensorRT/FP16 renderer path with a feasible
+higher-precision reference. Treat this as localization evidence, not an
+assumption that precision is the cause.
 
 ### Temporal-filter sweep
 

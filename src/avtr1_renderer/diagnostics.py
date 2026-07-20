@@ -24,11 +24,19 @@ import roma
 import torch
 
 from avtr1_renderer.constants import LIPSYNC_COORDS
-from avtr1_renderer.types import KPInfo, MotionStabilizationOptions, RenderOptions
+from avtr1_renderer.types import (
+    GeometryStabilizationOptions,
+    KPInfo,
+    MotionStabilizationOptions,
+    RenderOptions,
+    TurnAwareGuidanceOptions,
+)
 
 if TYPE_CHECKING:
     from avtr1_renderer.components.liveportrait.motion_stitch import MotionFrame
+    from avtr1_renderer.keypoint_stabilizer import KeypointStabilizationResult
     from avtr1_renderer.motion_stabilizer import MotionStabilizationResult
+    from avtr1_renderer.turn_guidance import TurnGuidanceResult
 
 LOGGER_NAME = "avtr1_renderer.motion_debug"
 
@@ -148,12 +156,93 @@ def record_options(options: RenderOptions) -> None:
                     ]
                 ),
             },
+            "geometry_stabilization": {
+                "enabled": options.geometry.enabled,
+                "stitch_strength": options.geometry.stitch_strength,
+                "stitch_temporal_filter": options.geometry.stitch_temporal_filter,
+                "stitch_one_euro_min_cutoff_hz": (
+                    options.geometry.stitch_one_euro_min_cutoff_hz
+                ),
+                "stitch_one_euro_beta": options.geometry.stitch_one_euro_beta,
+                "stitch_one_euro_derivative_cutoff_hz": (
+                    options.geometry.stitch_one_euro_derivative_cutoff_hz
+                ),
+                "stitch_temporal_max_correction": (
+                    options.geometry.stitch_temporal_max_correction
+                ),
+                "post_stitch_enabled": options.geometry.post_stitch_enabled,
+                "post_stitch_one_euro_min_cutoff_hz": (
+                    options.geometry.post_stitch_one_euro_min_cutoff_hz
+                ),
+                "post_stitch_one_euro_beta": options.geometry.post_stitch_one_euro_beta,
+                "post_stitch_one_euro_derivative_cutoff_hz": (
+                    options.geometry.post_stitch_one_euro_derivative_cutoff_hz
+                ),
+                "post_stitch_strength": options.geometry.post_stitch_strength,
+                "post_stitch_max_correction": options.geometry.post_stitch_max_correction,
+                "post_stitch_keypoint_indices": (
+                    None
+                    if options.geometry.post_stitch_keypoint_indices is None
+                    else list(options.geometry.post_stitch_keypoint_indices)
+                ),
+            },
+            "turn_guidance": {
+                "mode": options.turn_guidance.mode,
+                "speaking_cfg_other_audio": (
+                    options.turn_guidance.speaking_cfg_other_audio
+                ),
+                "listening_cfg_other_audio": (
+                    options.turn_guidance.listening_cfg_other_audio
+                ),
+                "speech_rms_on": options.turn_guidance.speech_rms_on,
+                "speech_rms_off": options.turn_guidance.speech_rms_off,
+                "listen_rms_on": options.turn_guidance.listen_rms_on,
+                "listen_rms_off": options.turn_guidance.listen_rms_off,
+                "hysteresis_chunks": options.turn_guidance.hysteresis_chunks,
+                "minimum_state_chunks": options.turn_guidance.minimum_state_chunks,
+                "transition_chunks": options.turn_guidance.transition_chunks,
+            },
         },
     )
 
 
 def record_session(**metadata: Any) -> None:
     _emit("session", metadata)
+
+
+def record_motion_trajectory(**metadata: Any) -> None:
+    _emit("motion_trajectory", metadata)
+
+
+def record_stage_artifact(**metadata: Any) -> None:
+    _emit("stage_artifact", metadata)
+
+
+def record_turn_guidance(
+    options: TurnAwareGuidanceOptions,
+    result: TurnGuidanceResult,
+) -> None:
+    _emit(
+        "turn_guidance",
+        {
+            "mode": options.mode,
+            "observed_turn": result.observed_turn,
+            "stable_turn": result.stable_turn,
+            "state_changed": result.state_changed,
+            "speech_rms": result.speech_rms,
+            "listen_rms": result.listen_rms,
+            "effective_cfg_other_audio": result.effective_cfg_other_audio,
+            "pending_state_code": (
+                None if result.state is None else result.state.pending_state_code
+            ),
+            "pending_chunks": (
+                None if result.state is None else result.state.pending_chunks
+            ),
+            "state_age_chunks": (
+                None if result.state is None else result.state.state_age_chunks
+            ),
+        },
+    )
 
 
 def record_avatar_registration(
@@ -412,19 +501,49 @@ def _keypoint_geometry(keypoints: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def _keypoint_correction_kinematics(values: torch.Tensor) -> dict[str, Any]:
+    velocity = values[1:] - values[:-1]
+    acceleration = velocity[1:] - velocity[:-1]
+    jerk = acceleration[1:] - acceleration[:-1]
+
+    def frame_mean_l2(rows: torch.Tensor) -> torch.Tensor:
+        if rows.numel() == 0:
+            return rows.new_empty(0)
+        return torch.linalg.vector_norm(rows, dim=-1).mean(dim=-1)
+
+    return {
+        "magnitude_mean_l2": _series(frame_mean_l2(values)),
+        "velocity_mean_l2": _series(frame_mean_l2(velocity)),
+        "acceleration_mean_l2": _series(frame_mean_l2(acceleration)),
+        "jerk_mean_l2": _series(frame_mean_l2(jerk)),
+    }
+
+
 def record_keypoint_geometry(
     source: torch.Tensor,
     driving_raw: torch.Tensor,
-    driving_stitched: torch.Tensor,
+    driving_network: torch.Tensor,
+    driving_final: torch.Tensor,
+    *,
+    stabilization: KeypointStabilizationResult,
+    options: GeometryStabilizationOptions,
 ) -> None:
     if not enabled():
         return
 
-    correction = torch.linalg.vector_norm(driving_stitched - driving_raw, dim=-1).mean(dim=1)
+    correction = torch.linalg.vector_norm(driving_network - driving_raw, dim=-1).mean(dim=1)
     per_keypoint_correction = torch.linalg.vector_norm(
-        driving_stitched - driving_raw,
+        driving_network - driving_raw,
         dim=-1,
     )
+    final_correction = torch.linalg.vector_norm(driving_final - driving_raw, dim=-1).mean(dim=1)
+    stitch_temporal = torch.linalg.vector_norm(
+        stabilization.stitch_temporal_correction,
+        dim=-1,
+    )
+    post_stitch = torch.linalg.vector_norm(stabilization.post_stitch_correction, dim=-1)
+    stitch_cap_hits = stitch_temporal >= options.stitch_temporal_max_correction - 1e-8
+    post_cap_hits = post_stitch >= options.post_stitch_max_correction - 1e-8
     affected = _LIPSYNC_KEYPOINT_INDICES
     source_locked = [index for index in range(source.shape[1]) if index not in affected]
     _emit(
@@ -432,16 +551,23 @@ def record_keypoint_geometry(
         {
             "source": _keypoint_geometry(source),
             "driving_raw": _keypoint_geometry(driving_raw),
-            "driving_stitched": _keypoint_geometry(driving_stitched),
+            "driving_network": _keypoint_geometry(driving_network),
+            # Keep the established field as the geometry actually sent to warp.
+            "driving_stitched": _keypoint_geometry(driving_final),
+            "driving_final": _keypoint_geometry(driving_final),
             "lipsync_keypoint_indices": affected,
             "source_locked_keypoint_indices": source_locked,
             "driving_raw_lipsync_subset": _keypoint_geometry(driving_raw[:, affected]),
-            "driving_stitched_lipsync_subset": _keypoint_geometry(driving_stitched[:, affected]),
+            "driving_network_lipsync_subset": _keypoint_geometry(
+                driving_network[:, affected]
+            ),
+            "driving_stitched_lipsync_subset": _keypoint_geometry(driving_final[:, affected]),
             "driving_raw_source_locked_subset": _keypoint_geometry(driving_raw[:, source_locked]),
             "driving_stitched_source_locked_subset": _keypoint_geometry(
-                driving_stitched[:, source_locked]
+                driving_final[:, source_locked]
             ),
             "stitch_correction_mean_l2": _series(correction),
+            "final_correction_mean_l2": _series(final_correction),
             "stitch_correction_per_keypoint_l2": {
                 "values": per_keypoint_correction.detach().float().transpose(0, 1).tolist(),
                 "p95": torch.quantile(
@@ -450,6 +576,47 @@ def record_keypoint_geometry(
                     dim=0,
                 ).tolist(),
                 "max": per_keypoint_correction.float().amax(dim=0).tolist(),
+            },
+            "geometry_stabilization": {
+                "enabled": options.enabled,
+                "state_reset": stabilization.state_reset,
+                "keypoint_indices": list(stabilization.keypoint_indices),
+                "similarity_scale": _series(stabilization.similarity_scale),
+                "stitch_temporal_correction_per_keypoint_l2": {
+                    "values": stitch_temporal.detach().float().transpose(0, 1).tolist(),
+                    "p95": torch.quantile(stitch_temporal.float(), 0.95, dim=0).tolist(),
+                    "max": stitch_temporal.float().amax(dim=0).tolist(),
+                },
+                "stitch_network_correction_kinematics": (
+                    _keypoint_correction_kinematics(stabilization.network_correction)
+                ),
+                "filtered_stitch_correction_kinematics": (
+                    _keypoint_correction_kinematics(
+                        stabilization.filtered_stitch_correction
+                    )
+                ),
+                "post_stitch_correction_kinematics": (
+                    _keypoint_correction_kinematics(stabilization.post_stitch_correction)
+                ),
+                "post_stitch_correction_per_keypoint_l2": {
+                    "values": post_stitch.detach().float().transpose(0, 1).tolist(),
+                    "p95": torch.quantile(post_stitch.float(), 0.95, dim=0).tolist(),
+                    "max": post_stitch.float().amax(dim=0).tolist(),
+                },
+                "aligned_residual_raw_l2": _series(
+                    _row_norms(stabilization.aligned_residual_raw.reshape(-1, 3))
+                ),
+                "aligned_residual_corrected_l2": _series(
+                    _row_norms(stabilization.aligned_residual_corrected.reshape(-1, 3))
+                ),
+                "stitch_temporal_intervention_frames": int(
+                    (stitch_temporal > 1e-8).any(dim=1).sum().item()
+                ),
+                "post_stitch_intervention_frames": int(
+                    (post_stitch > 1e-8).any(dim=1).sum().item()
+                ),
+                "stitch_temporal_cap_hits": int(stitch_cap_hits.sum().item()),
+                "post_stitch_cap_hits": int(post_cap_hits.sum().item()),
             },
         },
     )
@@ -489,8 +656,11 @@ __all__ = [
     "record_keypoint_geometry",
     "record_motion_prediction",
     "record_motion_stabilization",
+    "record_motion_trajectory",
     "record_options",
     "record_render_alpha",
     "record_session",
+    "record_stage_artifact",
+    "record_turn_guidance",
     "trace_scope",
 ]

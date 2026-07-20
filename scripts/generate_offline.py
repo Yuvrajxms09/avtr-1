@@ -22,9 +22,11 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -34,15 +36,114 @@ import soxr
 import torch
 
 from avtr1_renderer.avatar_loader import CropConfig
-from avtr1_renderer.avtr1_artifact_manager import get_artifact_manager
+from avtr1_renderer.avtr1_artifact_manager import get_artifact_manager, get_storage_root
 from avtr1_renderer.constants import LIPSYNC_COORDS
 from avtr1_renderer.diagnostics import LOGGER_NAME, record_session
 from avtr1_renderer.frame_size import read_native_output_size
+from avtr1_renderer.motion_trajectory import MotionTrajectorySession
 from avtr1_renderer.pipeline import Pipeline
-from avtr1_renderer.types import Chunk, MotionStabilizationOptions, RenderOptions
+from avtr1_renderer.stage_artifacts import StageArtifactSession, record_geometry_stage
+from avtr1_renderer.types import (
+    Chunk,
+    GeometryStabilizationOptions,
+    MotionStabilizationOptions,
+    RenderOptions,
+    TurnAwareGuidanceOptions,
+)
 
 SAMPLE_RATE = 16_000
 FPS = 25
+
+
+def _array_sha256(*arrays: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    for array in arrays:
+        contiguous = np.ascontiguousarray(array)
+        digest.update(str(contiguous.dtype).encode("ascii"))
+        digest.update(json.dumps(list(contiguous.shape)).encode("ascii"))
+        digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
+def _avatar_fingerprint(avatar) -> str:
+    digest = hashlib.sha256()
+    for tensor in (
+        avatar.kp_info.kp,
+        avatar.kp_info.exp,
+        avatar.kp_info.scale,
+        avatar.kp_info.t,
+        avatar.kp_info.R,
+    ):
+        value = tensor.detach().float().cpu().contiguous().numpy()
+        digest.update(value.tobytes())
+    digest.update(str(tuple(avatar.source.shape)).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _normalizer_fingerprint(normalizer) -> str:
+    digest = hashlib.sha256()
+    for name in (
+        "offset_so3",
+        "scale_so3",
+        "offset_kp",
+        "scale_kp",
+        "offset_exp",
+        "scale_exp",
+        "exp_lipsync_offset",
+        "exp_lipsync_scale",
+    ):
+        value = getattr(normalizer, name).detach().float().cpu().contiguous().numpy()
+        digest.update(name.encode("ascii"))
+        digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+def _parse_keypoint_indices(value: str | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    try:
+        return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise ValueError("keypoint indices must be comma-separated integers") from exc
+
+
+def _repository_commit() -> str:
+    git_dir = Path(__file__).resolve().parents[1] / ".git"
+    try:
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref: "):
+            return (git_dir / head[5:]).read_text(encoding="utf-8").strip()
+        return head
+    except OSError:
+        return "unknown"
+
+
+def _source_tree_fingerprint() -> str:
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    paths = sorted((root / "src").rglob("*.py")) + sorted((root / "scripts").rglob("*.py"))
+    for path in paths:
+        digest.update(str(path.relative_to(root)).encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _engine_manifest(*, motion_only: bool = False) -> str:
+    root = get_storage_root()
+    entries = []
+    runtime_paths = sorted({*root.rglob("*.engine"), *root.rglob("*.onnx")})
+    for path in runtime_paths:
+        if motion_only and "speech2motion" not in str(path.relative_to(root)):
+            continue
+        stat = path.stat()
+        entries.append(
+            {
+                "path": str(path.relative_to(root)),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    return json.dumps(entries, sort_keys=True, separators=(",", ":"))
 
 
 def _load_mono_16k(path: Path) -> np.ndarray:
@@ -196,6 +297,12 @@ def main() -> None:
         "Odd dimensions are reduced by one pixel for YUV420 encoding.",
     )
     parser.add_argument(
+        "--renderer-backend",
+        choices=("auto", "onnx"),
+        default="auto",
+        help="Prefer TensorRT or force the ONNX renderer reference path.",
+    )
+    parser.add_argument(
         "--cfg-self-audio",
         type=float,
         default=render_defaults.cfg_self_audio,
@@ -213,6 +320,21 @@ def main() -> None:
         default=render_defaults.cfg_kp,
         help="Source keypoint/identity guidance strength.",
     )
+    parser.add_argument(
+        "--turn-guidance",
+        choices=("disabled", "auto", "speaking", "listening", "overlap", "silence"),
+        default="disabled",
+        help="Select cfg-other by turn state; disabled preserves --cfg-other-audio.",
+    )
+    parser.add_argument("--speaking-cfg-other-audio", type=float, default=1.0)
+    parser.add_argument("--listening-cfg-other-audio", type=float, default=2.0)
+    parser.add_argument("--speech-rms-on", type=float, default=0.01)
+    parser.add_argument("--speech-rms-off", type=float, default=0.005)
+    parser.add_argument("--listen-rms-on", type=float, default=0.01)
+    parser.add_argument("--listen-rms-off", type=float, default=0.005)
+    parser.add_argument("--turn-hysteresis-chunks", type=int, default=2)
+    parser.add_argument("--turn-minimum-state-chunks", type=int, default=2)
+    parser.add_argument("--turn-transition-chunks", type=int, default=2)
     parser.add_argument(
         "--noise-alpha",
         type=float,
@@ -271,6 +393,30 @@ def main() -> None:
         type=Path,
         default=None,
         help="Write JSONL diagnostics to this path; reduces throughput.",
+    )
+    trajectory_group = parser.add_mutually_exclusive_group()
+    trajectory_group.add_argument(
+        "--motion-capture",
+        type=Path,
+        default=None,
+        help="Persist the raw normalized trajectory for deterministic replay.",
+    )
+    trajectory_group.add_argument(
+        "--motion-replay",
+        type=Path,
+        default=None,
+        help="Replace generated raw motion with a fingerprint-validated capture.",
+    )
+    parser.add_argument(
+        "--stage-capture-dir",
+        type=Path,
+        default=None,
+        help="Write raw/network/final keypoints and a stage manifest (requires replay).",
+    )
+    parser.add_argument(
+        "--stage-capture-pixels",
+        action="store_true",
+        help="Also write lossless decoded-face and final-composite PNG sequences.",
     )
     parser.add_argument(
         "--motion-stabilization",
@@ -376,6 +522,40 @@ def main() -> None:
         default=0.0,
         help="Per-frame normalized jerk limit; zero disables it.",
     )
+    parser.add_argument(
+        "--stitch-strength",
+        type=float,
+        default=1.0,
+        help="Blend strength for the stitch-network correction in [0, 1].",
+    )
+    parser.add_argument(
+        "--stitch-temporal-filter",
+        choices=("none", "one_euro"),
+        default="none",
+        help="Optional temporal filter for stitch-network corrections.",
+    )
+    parser.add_argument("--stitch-one-euro-min-cutoff-hz", type=float, default=3.0)
+    parser.add_argument("--stitch-one-euro-beta", type=float, default=0.2)
+    parser.add_argument("--stitch-one-euro-derivative-cutoff-hz", type=float, default=1.0)
+    parser.add_argument("--stitch-temporal-max-correction", type=float, default=0.01)
+    parser.add_argument(
+        "--post-stitch-stabilization",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Filter rigid-aligned residuals on a reviewed non-lipsync subset.",
+    )
+    parser.add_argument("--post-stitch-one-euro-min-cutoff-hz", type=float, default=3.0)
+    parser.add_argument("--post-stitch-one-euro-beta", type=float, default=0.2)
+    parser.add_argument(
+        "--post-stitch-one-euro-derivative-cutoff-hz", type=float, default=1.0
+    )
+    parser.add_argument("--post-stitch-strength", type=float, default=1.0)
+    parser.add_argument("--post-stitch-max-correction", type=float, default=0.01)
+    parser.add_argument(
+        "--post-stitch-keypoints",
+        default=None,
+        help="Reviewed comma-separated keypoint IDs; defaults to source-locked IDs.",
+    )
     args = parser.parse_args()
 
     if args.speech is None and args.listen is None and args.duration is None:
@@ -388,6 +568,30 @@ def main() -> None:
         parser.error("--ode-steps must be at least 2.")
     if args.crop_scale <= 0:
         parser.error("--crop-scale must be greater than zero.")
+    if args.stage_capture_dir is not None and args.motion_replay is None:
+        parser.error("--stage-capture-dir requires --motion-replay for deterministic evidence")
+    if args.stage_capture_pixels and args.stage_capture_dir is None:
+        parser.error("--stage-capture-pixels requires --stage-capture-dir")
+    if args.motion_capture is not None and args.motion_capture.exists():
+        parser.error(f"--motion-capture refuses to overwrite {args.motion_capture}")
+    if args.motion_capture is not None:
+        capture_temporary = args.motion_capture.with_suffix(
+            args.motion_capture.suffix + ".tmp"
+        )
+        if capture_temporary.exists():
+            parser.error(
+                f"--motion-capture found an incomplete prior capture: {capture_temporary}"
+            )
+    if args.motion_replay is not None and not args.motion_replay.is_file():
+        parser.error(f"--motion-replay file does not exist: {args.motion_replay}")
+    if (
+        args.stage_capture_dir is not None
+        and args.stage_capture_dir.exists()
+        and any(args.stage_capture_dir.iterdir())
+    ):
+        parser.error(
+            f"--stage-capture-dir must be empty or absent: {args.stage_capture_dir}"
+        )
     for flag, value in (
         ("--rotation-acceleration-threshold-deg", args.rotation_acceleration_threshold_deg),
         ("--rotation-max-correction-deg", args.rotation_max_correction_deg),
@@ -440,6 +644,47 @@ def main() -> None:
         stabilization.validate(expression_coordinates=len(LIPSYNC_COORDS))
     except ValueError as exc:
         parser.error(str(exc))
+    try:
+        post_stitch_keypoints = _parse_keypoint_indices(args.post_stitch_keypoints)
+    except ValueError as exc:
+        parser.error(str(exc))
+    geometry = GeometryStabilizationOptions(
+        stitch_strength=args.stitch_strength,
+        stitch_temporal_filter=args.stitch_temporal_filter,
+        stitch_one_euro_min_cutoff_hz=args.stitch_one_euro_min_cutoff_hz,
+        stitch_one_euro_beta=args.stitch_one_euro_beta,
+        stitch_one_euro_derivative_cutoff_hz=args.stitch_one_euro_derivative_cutoff_hz,
+        stitch_temporal_max_correction=args.stitch_temporal_max_correction,
+        post_stitch_enabled=args.post_stitch_stabilization,
+        post_stitch_one_euro_min_cutoff_hz=args.post_stitch_one_euro_min_cutoff_hz,
+        post_stitch_one_euro_beta=args.post_stitch_one_euro_beta,
+        post_stitch_one_euro_derivative_cutoff_hz=(
+            args.post_stitch_one_euro_derivative_cutoff_hz
+        ),
+        post_stitch_strength=args.post_stitch_strength,
+        post_stitch_max_correction=args.post_stitch_max_correction,
+        post_stitch_keypoint_indices=post_stitch_keypoints,
+    )
+    try:
+        geometry.validate(keypoint_count=21)
+    except ValueError as exc:
+        parser.error(str(exc))
+    turn_guidance = TurnAwareGuidanceOptions(
+        mode=args.turn_guidance,
+        speaking_cfg_other_audio=args.speaking_cfg_other_audio,
+        listening_cfg_other_audio=args.listening_cfg_other_audio,
+        speech_rms_on=args.speech_rms_on,
+        speech_rms_off=args.speech_rms_off,
+        listen_rms_on=args.listen_rms_on,
+        listen_rms_off=args.listen_rms_off,
+        hysteresis_chunks=args.turn_hysteresis_chunks,
+        minimum_state_chunks=args.turn_minimum_state_chunks,
+        transition_chunks=args.turn_transition_chunks,
+    )
+    try:
+        turn_guidance.validate()
+    except ValueError as exc:
+        parser.error(str(exc))
 
     out_size = (720, 1280)
     if args.native_size:
@@ -475,6 +720,29 @@ def main() -> None:
         output_height=out_size[0],
         output_width=out_size[1],
         motion_stabilization=args.motion_stabilization,
+        motion_capture=str(args.motion_capture) if args.motion_capture else None,
+        motion_replay=str(args.motion_replay) if args.motion_replay else None,
+        stage_capture_dir=str(args.stage_capture_dir) if args.stage_capture_dir else None,
+        stage_capture_pixels=args.stage_capture_pixels,
+        renderer_backend=args.renderer_backend,
+        geometry_stabilization={
+            "stitch_strength": args.stitch_strength,
+            "stitch_temporal_filter": args.stitch_temporal_filter,
+            "post_stitch_enabled": args.post_stitch_stabilization,
+            "post_stitch_keypoints": post_stitch_keypoints,
+        },
+        turn_guidance={
+            "mode": args.turn_guidance,
+            "speaking_cfg_other_audio": args.speaking_cfg_other_audio,
+            "listening_cfg_other_audio": args.listening_cfg_other_audio,
+            "speech_rms_on": args.speech_rms_on,
+            "speech_rms_off": args.speech_rms_off,
+            "listen_rms_on": args.listen_rms_on,
+            "listen_rms_off": args.listen_rms_off,
+            "hysteresis_chunks": args.turn_hysteresis_chunks,
+            "minimum_state_chunks": args.turn_minimum_state_chunks,
+            "transition_chunks": args.turn_transition_chunks,
+        },
         expression_profile=(
             str(args.expression_profile) if args.expression_profile is not None else None
         ),
@@ -503,6 +771,7 @@ def main() -> None:
         crop_config=crop_config,
         n_ode_steps=args.ode_steps,
         out_size=out_size,
+        renderer_backend=args.renderer_backend,
     )
     avatar = registry[args.avatar]
 
@@ -517,6 +786,64 @@ def main() -> None:
         f"Chunks: {n_chunks}  frames: {n_chunks * frames_per_chunk}  "
         f"({n_chunks * frames_per_chunk / FPS:.1f}s at {FPS} fps)"
     )
+    trajectory_metadata = {
+        "repository_commit": _repository_commit(),
+        "source_tree_fingerprint_sha256": _source_tree_fingerprint(),
+        "motion_engine_manifest": _engine_manifest(motion_only=True),
+        "artifact_root": str(get_storage_root()),
+        "avatar_id": args.avatar,
+        "avatar_fingerprint_sha256": _avatar_fingerprint(avatar),
+        "normalizer_fingerprint_sha256": _normalizer_fingerprint(
+            pipeline._motion_generator._normalizer
+        ),
+        "audio_fingerprint_sha256": _array_sha256(speech, listen),
+        "fps": FPS,
+        "chunk_size": frames_per_chunk,
+        "chunks": n_chunks,
+        "cfg_self_audio": args.cfg_self_audio,
+        "cfg_other_audio": args.cfg_other_audio,
+        "turn_guidance_mode": args.turn_guidance,
+        "speaking_cfg_other_audio": args.speaking_cfg_other_audio,
+        "listening_cfg_other_audio": args.listening_cfg_other_audio,
+        "speech_rms_on": args.speech_rms_on,
+        "speech_rms_off": args.speech_rms_off,
+        "listen_rms_on": args.listen_rms_on,
+        "listen_rms_off": args.listen_rms_off,
+        "turn_hysteresis_chunks": args.turn_hysteresis_chunks,
+        "turn_minimum_state_chunks": args.turn_minimum_state_chunks,
+        "turn_transition_chunks": args.turn_transition_chunks,
+        "cfg_kp": args.cfg_kp,
+        "noise_alpha": args.noise_alpha,
+        "noise_trunc_z": args.noise_trunc_z,
+        "ode_steps": args.ode_steps,
+        "seed": args.seed,
+        "crop_scale": args.crop_scale,
+        "crop_vx_ratio": args.crop_vx_ratio,
+        "crop_vy_ratio": args.crop_vy_ratio,
+        "crop_rotation": args.crop_rotation,
+        "output_height": out_size[0],
+        "output_width": out_size[1],
+    }
+
+    replay_session = None
+    if args.motion_replay is not None:
+        replay_expected = {
+            key: value
+            for key, value in trajectory_metadata.items()
+            if key
+            not in {
+                "repository_commit",
+                "source_tree_fingerprint_sha256",
+                "motion_engine_manifest",
+                "artifact_root",
+            }
+        }
+        # Validate the capture before opening the output writer. A bad or
+        # mismatched replay must not leave a misleading partial video behind.
+        replay_session = MotionTrajectorySession.replay(
+            args.motion_replay,
+            replay_expected,
+        )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     out_h, out_w = avatar.source.shape[-2:]
@@ -547,6 +874,8 @@ def main() -> None:
         noise_alpha=args.noise_alpha,
         noise_trunc_z=args.noise_trunc_z,
         stabilization=stabilization,
+        geometry=geometry,
+        turn_guidance=turn_guidance,
         stream_frames=args.stream_frames,
     )
     print(
@@ -560,6 +889,12 @@ def main() -> None:
         f"seed={args.seed}"
     )
     print(
+        "Turn guidance: "
+        f"mode={args.turn_guidance} "
+        f"speaking_cfg_other={args.speaking_cfg_other_audio:g} "
+        f"listening_cfg_other={args.listening_cfg_other_audio:g}"
+    )
+    print(
         "Stabilization: "
         f"mode={args.motion_stabilization} "
         f"rotation_spike={args.rotation_spike_guard} "
@@ -571,31 +906,95 @@ def main() -> None:
         f"rotation_accel_limit={args.rotation_max_acceleration_deg:g}deg "
         f"rotation_jerk_limit={args.rotation_max_jerk_deg:g}deg "
         f"expression_filter={args.expression_temporal_filter} "
-        f"expression_profile={args.expression_profile or 'none'}"
+        f"expression_profile={args.expression_profile or 'none'} "
+        f"stitch_strength={args.stitch_strength:g} "
+        f"stitch_filter={args.stitch_temporal_filter} "
+        f"post_stitch={args.post_stitch_stabilization}"
     )
     state = None
     produced = 0
     chunk_times: list[float] = []
 
     try:
-        for i, (sp, ls) in enumerate(zip(speech_chunks, listen_chunks, strict=True)):
-            t0 = time.perf_counter()
-            chunk = Chunk(audio_speech=sp, audio_listen=ls)
-            state, frames_iter = pipeline.process_chunk(avatar, chunk, state, options)
-            for frame in frames_iter:
-                writer.send(frame.data.tobytes())
-                produced += 1
-            chunk_times.append((time.perf_counter() - t0) * 1000)
-            if (i + 1) % 25 == 0 or i == n_chunks - 1:
-                avg_ms = sum(chunk_times) / len(chunk_times)
-                chunk_times.clear()
-                print(
-                    f"  chunk {i + 1}/{n_chunks} "
-                    f"({produced} frames, {produced / FPS:.1f}s, avg {avg_ms:.0f} ms/chunk)"
+        with ExitStack() as experiment_stack:
+            trajectory_session = None
+            if args.motion_capture is not None:
+                trajectory_session = experiment_stack.enter_context(
+                    MotionTrajectorySession.capture(args.motion_capture, trajectory_metadata)
                 )
+            elif replay_session is not None:
+                trajectory_session = experiment_stack.enter_context(
+                    replay_session
+                )
+            if args.stage_capture_dir is not None:
+                assert trajectory_session is not None
+                experiment_stack.enter_context(
+                    StageArtifactSession(
+                        args.stage_capture_dir,
+                        metadata={
+                            **trajectory_metadata,
+                            "renderer_engine_manifest": _engine_manifest(),
+                            "renderer_backend": args.renderer_backend,
+                            "motion_trajectory_path": args.motion_replay,
+                            "motion_fingerprint_sha256": trajectory_session.fingerprint,
+                            "motion_stabilization": args.motion_stabilization,
+                            "geometry_options": json.dumps(
+                                {
+                                    "stitch_strength": args.stitch_strength,
+                                    "stitch_temporal_filter": args.stitch_temporal_filter,
+                                    "stitch_cutoff_hz": args.stitch_one_euro_min_cutoff_hz,
+                                    "stitch_beta": args.stitch_one_euro_beta,
+                                    "post_stitch_enabled": args.post_stitch_stabilization,
+                                    "post_stitch_cutoff_hz": (
+                                        args.post_stitch_one_euro_min_cutoff_hz
+                                    ),
+                                    "post_stitch_beta": args.post_stitch_one_euro_beta,
+                                    "post_stitch_strength": args.post_stitch_strength,
+                                    "post_stitch_keypoints": post_stitch_keypoints,
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        },
+                        capture_pixels=args.stage_capture_pixels,
+                    )
+                )
+
+            for i, (sp, ls) in enumerate(zip(speech_chunks, listen_chunks, strict=True)):
+                t0 = time.perf_counter()
+                current_speech = sp[:step]
+                current_listen = ls[:step]
+                audio_rms = torch.tensor(
+                    [
+                        float(np.sqrt(np.mean(np.square(current_speech)))),
+                        float(np.sqrt(np.mean(np.square(current_listen)))),
+                    ],
+                    dtype=torch.float32,
+                ).repeat(frames_per_chunk, 1)
+                record_geometry_stage("audio_rms", audio_rms)
+                chunk = Chunk(audio_speech=sp, audio_listen=ls)
+                state, frames_iter = pipeline.process_chunk(avatar, chunk, state, options)
+                for frame in frames_iter:
+                    writer.send(frame.data.tobytes())
+                    produced += 1
+                chunk_times.append((time.perf_counter() - t0) * 1000)
+                if (i + 1) % 25 == 0 or i == n_chunks - 1:
+                    avg_ms = sum(chunk_times) / len(chunk_times)
+                    chunk_times.clear()
+                    print(
+                        f"  chunk {i + 1}/{n_chunks} "
+                        f"({produced} frames, {produced / FPS:.1f}s, avg {avg_ms:.0f} ms/chunk)"
+                    )
     finally:
         writer.close()
 
+    if trajectory_session is not None:
+        print(
+            f"Motion trajectory: mode={trajectory_session.mode} "
+            f"fingerprint={trajectory_session.fingerprint} path={trajectory_session.path}"
+        )
+    if args.stage_capture_dir is not None:
+        print(f"Stage artifacts: {args.stage_capture_dir / 'manifest.json'}")
     print(f"\nDone. {produced} frames ({produced / FPS:.1f}s) → {args.out}")
 
 

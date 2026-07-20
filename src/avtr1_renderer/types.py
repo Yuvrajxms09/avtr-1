@@ -112,6 +112,14 @@ FrameIterator = Iterator[Frame]
 
 MotionStabilizationMode = Literal["none", "rotation", "expression", "both"]
 TemporalFilterMode = Literal["none", "one_euro"]
+TurnGuidanceMode = Literal[
+    "disabled",
+    "auto",
+    "speaking",
+    "listening",
+    "overlap",
+    "silence",
+]
 
 
 @dataclass(slots=True, frozen=True)
@@ -232,6 +240,155 @@ class MotionStabilizationOptions:
 
 
 @dataclass(slots=True, frozen=True)
+class GeometryStabilizationOptions:
+    """Experimental post-motion geometry controls.
+
+    Defaults exactly preserve the stitch network output.  Stitch filtering
+    operates on the network correction before blending.  Post-stitch
+    filtering removes a per-frame 3D similarity transform, filters only the
+    reviewed source-locked residuals, and restores the original transform so
+    it cannot smooth global pose, translation, or scale.
+    """
+
+    stitch_strength: float = 1.0
+    stitch_temporal_filter: TemporalFilterMode = "none"
+    stitch_one_euro_min_cutoff_hz: float = 3.0
+    stitch_one_euro_beta: float = 0.2
+    stitch_one_euro_derivative_cutoff_hz: float = 1.0
+    stitch_temporal_max_correction: float = 0.01
+
+    post_stitch_enabled: bool = False
+    post_stitch_one_euro_min_cutoff_hz: float = 3.0
+    post_stitch_one_euro_beta: float = 0.2
+    post_stitch_one_euro_derivative_cutoff_hz: float = 1.0
+    post_stitch_strength: float = 1.0
+    post_stitch_max_correction: float = 0.01
+    post_stitch_keypoint_indices: tuple[int, ...] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self.stitch_strength != 1.0
+            or self.stitch_temporal_filter != "none"
+            or self.post_stitch_enabled
+        )
+
+    def validate(self, *, keypoint_count: int) -> None:
+        if not math.isfinite(self.stitch_strength) or not 0.0 <= self.stitch_strength <= 1.0:
+            raise ValueError(
+                f"stitch_strength must be in [0, 1], got {self.stitch_strength}"
+            )
+        if (
+            not math.isfinite(self.post_stitch_strength)
+            or not 0.0 <= self.post_stitch_strength <= 1.0
+        ):
+            raise ValueError(
+                "post_stitch_strength must be in [0, 1], got "
+                f"{self.post_stitch_strength}"
+            )
+        if self.stitch_temporal_filter not in {"none", "one_euro"}:
+            raise ValueError(
+                f"Unknown stitch_temporal_filter: {self.stitch_temporal_filter!r}"
+            )
+        for name, value in (
+            ("stitch_one_euro_min_cutoff_hz", self.stitch_one_euro_min_cutoff_hz),
+            (
+                "stitch_one_euro_derivative_cutoff_hz",
+                self.stitch_one_euro_derivative_cutoff_hz,
+            ),
+            ("stitch_temporal_max_correction", self.stitch_temporal_max_correction),
+            (
+                "post_stitch_one_euro_min_cutoff_hz",
+                self.post_stitch_one_euro_min_cutoff_hz,
+            ),
+            (
+                "post_stitch_one_euro_derivative_cutoff_hz",
+                self.post_stitch_one_euro_derivative_cutoff_hz,
+            ),
+            ("post_stitch_max_correction", self.post_stitch_max_correction),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be greater than zero, got {value}")
+        for name, value in (
+            ("stitch_one_euro_beta", self.stitch_one_euro_beta),
+            ("post_stitch_one_euro_beta", self.post_stitch_one_euro_beta),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+
+        indices = self.post_stitch_keypoint_indices
+        if indices is not None:
+            if self.post_stitch_enabled and not indices:
+                raise ValueError("post_stitch_keypoint_indices must not be empty when enabled")
+            if len(indices) != len(set(indices)):
+                raise ValueError("post_stitch_keypoint_indices must not contain duplicates")
+            if any(index < 0 or index >= keypoint_count for index in indices):
+                raise ValueError(
+                    "post_stitch_keypoint_indices must be valid keypoint indices in "
+                    f"[0, {keypoint_count - 1}]"
+                )
+            if self.post_stitch_enabled and len(indices) < 3:
+                raise ValueError("post-stitch stabilization requires at least three keypoints")
+
+
+@dataclass(slots=True, frozen=True)
+class TurnAwareGuidanceOptions:
+    """Chunk-level speaking/listening guidance controller.
+
+    ``auto`` uses Schmitt-trigger RMS thresholds. Explicit turn modes allow a
+    trusted upstream VAD/conversation controller to provide the observed state.
+    Overlap and silence hold the previous stable speaking/listening target.
+    """
+
+    mode: TurnGuidanceMode = "disabled"
+    speaking_cfg_other_audio: float = 1.0
+    listening_cfg_other_audio: float = 2.0
+    speech_rms_on: float = 0.01
+    speech_rms_off: float = 0.005
+    listen_rms_on: float = 0.01
+    listen_rms_off: float = 0.005
+    hysteresis_chunks: int = 2
+    minimum_state_chunks: int = 2
+    transition_chunks: int = 2
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "disabled"
+
+    def validate(self) -> None:
+        if self.mode not in {
+            "disabled",
+            "auto",
+            "speaking",
+            "listening",
+            "overlap",
+            "silence",
+        }:
+            raise ValueError(f"Unknown turn guidance mode: {self.mode!r}")
+        for name, value in (
+            ("speaking_cfg_other_audio", self.speaking_cfg_other_audio),
+            ("listening_cfg_other_audio", self.listening_cfg_other_audio),
+            ("speech_rms_on", self.speech_rms_on),
+            ("speech_rms_off", self.speech_rms_off),
+            ("listen_rms_on", self.listen_rms_on),
+            ("listen_rms_off", self.listen_rms_off),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
+        if self.speech_rms_off > self.speech_rms_on:
+            raise ValueError("speech_rms_off must not exceed speech_rms_on")
+        if self.listen_rms_off > self.listen_rms_on:
+            raise ValueError("listen_rms_off must not exceed listen_rms_on")
+        for name, value in (
+            ("hysteresis_chunks", self.hysteresis_chunks),
+            ("minimum_state_chunks", self.minimum_state_chunks),
+            ("transition_chunks", self.transition_chunks),
+        ):
+            if value < 1:
+                raise ValueError(f"{name} must be at least 1, got {value}")
+
+
+@dataclass(slots=True, frozen=True)
 class RenderOptions:
     """Per-request knobs for ``Pipeline.process_chunk``.
 
@@ -280,6 +437,12 @@ class RenderOptions:
     # --- Optional post-prediction temporal guards ---
     stabilization: MotionStabilizationOptions = field(default_factory=MotionStabilizationOptions)
 
+    # --- Optional stitch/post-stitch experiments ---
+    geometry: GeometryStabilizationOptions = field(default_factory=GeometryStabilizationOptions)
+
+    # --- Optional chunk-level speaking/listening CFG controller ---
+    turn_guidance: TurnAwareGuidanceOptions = field(default_factory=TurnAwareGuidanceOptions)
+
     stream_frames: bool = True
 
 
@@ -287,9 +450,12 @@ __all__ = [
     "Chunk",
     "Frame",
     "FrameIterator",
+    "GeometryStabilizationOptions",
     "KPInfo",
     "MotionStabilizationMode",
     "MotionStabilizationOptions",
     "RenderOptions",
     "TemporalFilterMode",
+    "TurnAwareGuidanceOptions",
+    "TurnGuidanceMode",
 ]
