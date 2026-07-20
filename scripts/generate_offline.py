@@ -66,31 +66,20 @@ def _array_sha256(*arrays: np.ndarray) -> str:
 
 
 def _avatar_fingerprint(avatar) -> str:
-    """Fingerprint avatar registration without hashing unstable float bytes.
+    """Fingerprint the stable avatar asset used by capture/replay.
 
-    Avatar registration runs through GPU/ONNX kernels and can differ by tiny
-    floating-point rounding errors between Python processes. Hashing the raw
-    bytes made capture/replay reject the same avatar after a fresh process.
-    Quantizing the registration tensors preserves identity-level changes while
-    ignoring that harmless numerical noise.
+    The detected keypoints are produced by GPU/ONNX registration kernels and
+    are not stable enough to serve as an exact cross-process identity. The
+    loaded source tensor is derived directly from the portrait asset and is
+    stable, while crop settings and engine metadata are validated separately.
     """
     digest = hashlib.sha256()
     digest.update(str(avatar.id).encode("utf-8"))
-    for name, tensor in (
-        ("kp", avatar.kp_info.kp),
-        ("exp", avatar.kp_info.exp),
-        ("scale", avatar.kp_info.scale),
-        ("translation", avatar.kp_info.t),
-        ("rotation", avatar.kp_info.R),
-    ):
-        value = tensor.detach().float().cpu().contiguous().numpy()
-        if not np.isfinite(value).all():
-            raise ValueError(f"Avatar registration tensor {name} contains non-finite values")
-        quantized = np.rint(value * 100_000.0).astype(np.int64)
-        digest.update(name.encode("ascii"))
-        digest.update(json.dumps(list(value.shape)).encode("ascii"))
-        digest.update(quantized.tobytes())
-    digest.update(json.dumps(list(avatar.source.shape)).encode("ascii"))
+    source = avatar.source.detach().float().cpu().contiguous().numpy()
+    if not np.isfinite(source).all():
+        raise ValueError("Avatar source contains non-finite values")
+    digest.update(json.dumps(list(source.shape)).encode("ascii"))
+    digest.update(source.tobytes())
     return digest.hexdigest()
 
 
