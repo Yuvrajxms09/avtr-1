@@ -66,17 +66,31 @@ def _array_sha256(*arrays: np.ndarray) -> str:
 
 
 def _avatar_fingerprint(avatar) -> str:
+    """Fingerprint avatar registration without hashing unstable float bytes.
+
+    Avatar registration runs through GPU/ONNX kernels and can differ by tiny
+    floating-point rounding errors between Python processes. Hashing the raw
+    bytes made capture/replay reject the same avatar after a fresh process.
+    Quantizing the registration tensors preserves identity-level changes while
+    ignoring that harmless numerical noise.
+    """
     digest = hashlib.sha256()
-    for tensor in (
-        avatar.kp_info.kp,
-        avatar.kp_info.exp,
-        avatar.kp_info.scale,
-        avatar.kp_info.t,
-        avatar.kp_info.R,
+    digest.update(str(avatar.id).encode("utf-8"))
+    for name, tensor in (
+        ("kp", avatar.kp_info.kp),
+        ("exp", avatar.kp_info.exp),
+        ("scale", avatar.kp_info.scale),
+        ("translation", avatar.kp_info.t),
+        ("rotation", avatar.kp_info.R),
     ):
         value = tensor.detach().float().cpu().contiguous().numpy()
-        digest.update(value.tobytes())
-    digest.update(str(tuple(avatar.source.shape)).encode("ascii"))
+        if not np.isfinite(value).all():
+            raise ValueError(f"Avatar registration tensor {name} contains non-finite values")
+        quantized = np.rint(value * 100_000.0).astype(np.int64)
+        digest.update(name.encode("ascii"))
+        digest.update(json.dumps(list(value.shape)).encode("ascii"))
+        digest.update(quantized.tobytes())
+    digest.update(json.dumps(list(avatar.source.shape)).encode("ascii"))
     return digest.hexdigest()
 
 
